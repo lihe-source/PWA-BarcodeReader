@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#4A90D9">
+  <title>BarcodePro</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <span class="app-title">BarcodePro</span>
+      <span class="app-version" id="versionDisplay"></span>
+    </header>
+
+    <!-- Update Banner -->
+    <div class="update-banner" id="updateBanner" style="display:none;">
+      有新版本可用，<a href="#" id="updateBtn">點擊更新</a>
+    </div>
+
+    <!-- Tab Contents -->
+    <main class="tab-content">
+      <!-- Scan Page -->
+      <section id="page-scan" class="page active">
+        <div class="scan-camera-wrap" id="scanCameraWrap">
+          <video id="scan-video" playsinline autoplay muted></video>
+          <div class="scan-overlay" id="scanOverlay">
+            <div class="scan-frame-outer">
+              <div class="scan-frame-inner">
+                <div class="scan-line"></div>
+              </div>
+            </div>
+            <div class="scan-hint">對準條碼進行掃描</div>
+          </div>
+          <!-- Toolbar -->
+          <div class="scan-toolbar">
+            <button class="scan-tool-btn" id="btnFlipCamera" title="切換鏡頭">🔄</button>
+            <button class="scan-tool-btn" id="btnTorch" title="閃光燈">🔦</button>
+          </div>
+        </div>
+        <!-- Permission error -->
+        <div class="scan-error" id="scanError" style="display:none;">
+          <div class="err-icon">📷</div>
+          <p>無法存取相機<br>請在設定中允許相機權限，再重新整理頁面</p>
+        </div>
+        <!-- Result card (hidden by default) -->
+        <div class="scan-result-wrap" id="scanResultWrap" style="display:none;">
+          <div class="scan-result-card">
+            <div class="result-label">掃描結果</div>
+            <div class="result-content" id="resultContent">—</div>
+            <div class="result-meta" id="resultMeta"></div>
+            <div class="result-actions">
+              <button class="btn btn-secondary" id="btnCopy">複製</button>
+              <button class="btn btn-primary" id="btnOpenUrl" style="display:none;">開啟網址</button>
+              <button class="btn btn-success" id="btnSaveScan">儲存</button>
+              <button class="btn btn-primary" id="btnContinueScan">繼續掃描</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Generate Page -->
+      <section id="page-generate" class="page">
+        <div class="gen-body">
+          <!-- Input -->
+          <div class="gen-card">
+            <div class="gen-section-title">輸入內容</div>
+            <textarea class="gen-textarea" id="genInput" placeholder="輸入條碼內容..." rows="3"></textarea>
+            <div class="gen-error" id="genError"></div>
+          </div>
+
+          <!-- Format selection -->
+          <div class="gen-card">
+            <div class="gen-section-title">一維條碼</div>
+            <div class="format-group">
+              <div class="format-chips" id="chips1D">
+                <div class="format-chip selected" data-format="CODE128">Code 128</div>
+                <div class="format-chip" data-format="EAN13">EAN-13</div>
+                <div class="format-chip" data-format="EAN8">EAN-8</div>
+                <div class="format-chip" data-format="UPCA">UPC-A</div>
+                <div class="format-chip" data-format="UPCE">UPC-E</div>
+                <div class="format-chip" data-format="CODE39">Code 39</div>
+                <div class="format-chip" data-format="ITF14">ITF-14</div>
+                <div class="format-chip" data-format="ISBN">ISBN</div>
+                <div class="format-chip" data-format="ISSN">ISSN</div>
+              </div>
+            </div>
+            <div class="gen-section-title" style="margin-top:10px;">二維條碼</div>
+            <div class="format-chips" id="chips2D">
+              <div class="format-chip" data-format="QRCODE">QR Code</div>
+              <div class="format-chip" data-format="DATAMATRIX">Data Matrix</div>
+              <div class="format-chip" data-format="PDF417">PDF417</div>
+              <div class="format-chip" data-format="GS1DATABAR">GS1 DataBar</div>
+            </div>
+          </div>
+
+          <!-- Preview -->
+          <div class="gen-canvas-wrap" id="genCanvasWrap">
+            <div class="gen-canvas-placeholder" id="genPlaceholder">輸入內容並選擇格式以預覽條碼</div>
+            <canvas id="gen-canvas" style="display:none;"></canvas>
+          </div>
+
+          <!-- Actions -->
+          <div class="gen-actions">
+            <button class="btn btn-primary" id="btnDownload">下載 PNG</button>
+            <button class="btn btn-secondary" id="btnShare">分享</button>
+            <button class="btn btn-success" id="btnSaveGen">存入歷史</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- History Page -->
+      <section id="page-history" class="page">
+        <div class="history-header">
+          <input type="search" class="history-search" id="historySearch" placeholder="🔍 搜尋條碼內容...">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <div class="history-filters" id="historyFilters">
+              <div class="filter-chip active" data-filter="all">全部</div>
+              <div class="filter-chip" data-filter="1D">一維</div>
+              <div class="filter-chip" data-filter="2D">二維</div>
+              <div class="filter-chip" data-filter="scan">掃描</div>
+              <div class="filter-chip" data-filter="generate">生成</div>
+            </div>
+            <button class="history-clear-btn" id="historyClearBtn">清除全部</button>
+          </div>
+        </div>
+        <div class="history-list" id="historyList"></div>
+      </section>
+    </main>
+
+    <!-- Tab Bar -->
+    <nav class="tab-bar">
+      <div class="tab active" data-page="scan">
+        <span class="tab-icon">📷</span>
+        <span>掃描</span>
+      </div>
+      <div class="tab" data-page="generate">
+        <span class="tab-icon">✏️</span>
+        <span>生成</span>
+      </div>
+      <div class="tab" data-page="history">
+        <span class="tab-icon">📋</span>
+        <span>歷史</span>
+      </div>
+    </nav>
+  </div>
+
+  <!-- Toast container -->
+  <div class="toast-wrap" id="toastWrap"></div>
+
+  <!-- Scripts -->
+  <script src="libs/dexie.min.js"></script>
+  <script src="libs/zxing.min.js"></script>
+  <script src="libs/jsbarcode.min.js"></script>
+  <script src="libs/bwip-js.min.js"></script>
+  <script src="version.js"></script>
+  <script src="update-config.js"></script>
+  <script src="db.js"></script>
+  <script src="ui.js"></script>
+  <script src="scanner.js"></script>
+  <script src="generator.js"></script>
+  <script src="history.js"></script>
+  <script src="export.js"></script>
+  <script src="updater.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
