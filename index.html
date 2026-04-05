@@ -13,10 +13,10 @@
 </head>
 <body>
   <div class="app-container">
-    <header class="app-header">
+    <header class="app-header"><div class="app-header-inner">
       <span class="app-title">BarcodePro</span>
       <span class="app-version" id="versionDisplay"></span>
-    </header>
+    </div></header>
     <div class="update-banner" id="updateBanner" style="display:none;">
       有新版本可用，<a href="#" id="updateBtn">點擊更新</a>
     </div>
@@ -151,7 +151,7 @@
       <section id="page-history" class="page">
         <div class="history-header">
           <input type="search" class="history-search" id="historySearch" placeholder="🔍 搜尋條碼內容...">
-          <div style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+          <div class="history-filter-row" style="margin-top:8px;">
             <div class="history-filters" id="historyFilters">
               <div class="filter-chip active" data-filter="all">全部</div>
               <div class="filter-chip" data-filter="1D">一維</div>
