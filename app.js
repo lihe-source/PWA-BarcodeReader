@@ -1,4 +1,4 @@
-// app.js — main app controller
+// app.js — V1_2: 4-tab routing (generate/import/scan/history)
 
 const App = (() => {
   let currentTab = 'scan';
@@ -13,23 +13,13 @@ const App = (() => {
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.page === tab));
     document.getElementById('page-' + tab).classList.add('active');
 
-    // Stop scan when leaving scan tab
-    if (prev === 'scan') {
-      Scanner.stop();
-      scanStarted = false;
-    }
-
-    // Start scan when entering scan tab
+    if (prev === 'scan') { Scanner.stop(); scanStarted = false; }
     if (tab === 'scan' && !scanStarted) {
       document.getElementById('scanResultWrap').style.display = 'none';
       Scanner.start();
       scanStarted = true;
     }
-
-    // Load history when entering history tab
-    if (tab === 'history') {
-      History.load();
-    }
+    if (tab === 'history') History.load();
   }
 
   function initScanToolbar() {
@@ -41,20 +31,15 @@ const App = (() => {
     document.getElementById('btnDownload').addEventListener('click', async () => {
       const gen = Generator.getLastGenerated();
       if (!gen) { UI.toast('請先生成條碼'); return; }
-      try {
-        await Export.downloadPNG(Generator.getCanvas(), gen.format);
-        UI.toast('下載成功');
-      } catch (e) { UI.toast('下載失敗：' + e.message); }
+      try { await Export.downloadPNG(Generator.getCanvas(), gen.format); UI.toast('下載成功'); }
+      catch (e) { UI.toast('下載失敗：' + e.message); }
     });
-
     document.getElementById('btnShare').addEventListener('click', async () => {
       const gen = Generator.getLastGenerated();
       if (!gen) { UI.toast('請先生成條碼'); return; }
-      try {
-        await Export.shareImage(Generator.getCanvas(), gen.format);
-      } catch (e) { UI.toast('分享失敗'); }
+      try { await Export.shareImage(Generator.getCanvas(), gen.format); }
+      catch { UI.toast('分享失敗'); }
     });
-
     document.getElementById('btnSaveGen').addEventListener('click', async () => {
       const gen = Generator.getLastGenerated();
       if (!gen) { UI.toast('請先生成條碼'); return; }
@@ -64,27 +49,19 @@ const App = (() => {
   }
 
   async function init() {
-    // Version display
     document.getElementById('versionDisplay').textContent = APP_VERSION;
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
 
-    // Register service worker
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./service-worker.js').catch(() => {});
-    }
+    document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.page)));
 
-    // Tab bar
-    document.querySelectorAll('.tab').forEach(t => {
-      t.addEventListener('click', () => switchTab(t.dataset.page));
-    });
-
-    // Init modules
     initScanToolbar();
     Generator.init();
     History.init();
     initGenerateActions();
+    Importer.init();
     Updater.init();
 
-    // Auto-start scanner on launch
+    // Default tab: scan
     Scanner.start();
     scanStarted = true;
   }
