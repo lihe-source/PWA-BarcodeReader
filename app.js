@@ -1,7 +1,8 @@
-// app.js — V1_2: 4-tab routing (generate/import/scan/history)
+// app.js — V1_5
+// Default tab: generate. Scanner uses pause/resume to avoid re-requesting camera permission.
 
 const App = (() => {
-  let currentTab = 'scan';
+  let currentTab = 'generate'; // default = generate
   let scanStarted = false;
 
   function switchTab(tab) {
@@ -13,12 +14,18 @@ const App = (() => {
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.page === tab));
     document.getElementById('page-' + tab).classList.add('active');
 
-    if (prev === 'scan') { Scanner.stop(); scanStarted = false; }
-    if (tab === 'scan' && !scanStarted) {
-      document.getElementById('scanResultWrap').style.display = 'none';
-      Scanner.start();
-      scanStarted = true;
+    // Camera lifecycle: pause (not stop) to keep stream alive between switches
+    if (prev === 'scan') Scanner.pause();
+
+    if (tab === 'scan') {
+      if (!scanStarted) {
+        Scanner.start();   // First time: start camera (triggers permission once)
+        scanStarted = true;
+      } else {
+        Scanner.resume();  // Subsequent: reuse existing stream, no permission prompt
+      }
     }
+
     if (tab === 'history') History.load();
   }
 
@@ -61,9 +68,17 @@ const App = (() => {
     Importer.init();
     Updater.init();
 
-    // Default tab: scan
-    Scanner.start();
-    scanStarted = true;
+    // Camera: only start when user switches to scan tab
+    // When app goes to background, fully stop camera (battery + privacy)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && currentTab === 'scan') {
+        Scanner.stop();
+        scanStarted = false;
+      } else if (!document.hidden && currentTab === 'scan') {
+        Scanner.start();
+        scanStarted = true;
+      }
+    });
   }
 
   return { init, switchTab };

@@ -32,7 +32,7 @@ const UI = {
     const bd = document.createElement('div');
     bd.className = 'modal-backdrop';
     const time = new Date(record.timestamp).toLocaleString('zh-TW');
-    const srcIcon = record.source === 'scan' ? '📷' : '✏️';
+    const srcIcon = record.source === 'scan' ? '📷' : record.source === 'import' ? '🖼️' : '✏️';
     bd.innerHTML =
       '<div class="modal-box">' +
         '<div class="modal-title">詳細資訊</div>' +
@@ -41,7 +41,7 @@ const UI = {
         '<div class="detail-label">格式</div>' +
         '<div class="detail-value">' + record.format + '（' + record.category + '）</div>' +
         '<div class="detail-label">來源</div>' +
-        '<div class="detail-value">' + srcIcon + ' ' + (record.source === 'scan' ? '掃描' : '生成') + '</div>' +
+        '<div class="detail-value">' + srcIcon + ' ' + ({scan:'掃描',generate:'生成',import:'圖片匯入'}[record.source]||record.source) + '</div>' +
         '<div class="detail-label">時間</div>' +
         '<div class="detail-value">' + time + '</div>' +
         '<div class="detail-actions">' +
