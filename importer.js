@@ -1,4 +1,4 @@
-// importer.js — V1_5
+// importer.js — V1_6
 // Multi-barcode detection: iteratively mask detected regions and re-scan.
 // Draws colored numbered boxes on preview canvas.
 // Saves ALL detected barcodes to history with source='import'.

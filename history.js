@@ -1,4 +1,4 @@
-// history.js — V1_5: added 'import' source support
+// history.js — V1_6: added 'import' source support
 
 const History = (() => {
   let allRecords = [];

@@ -1,4 +1,4 @@
-// app.js — V1_5
+// app.js — V1_6
 // Default tab: generate. Scanner uses pause/resume to avoid re-requesting camera permission.
 
 const App = (() => {
