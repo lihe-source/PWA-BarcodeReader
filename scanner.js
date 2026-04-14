@@ -1,16 +1,13 @@
-// scanner.js — V1_6
-// Optimizations vs V1_5:
-//  1. Prefer native BarcodeDetector API (iOS 17+ Safari uses Vision framework, near-native speed)
-//  2. ZXing fallback adds TRY_HARDER + ALSO_INVERTED hints
-//  3. Higher resolution camera constraints (1920x1080 ideal)
-//  4. Continuous focus + exposure + white balance via applyConstraints
-//  5. requestVideoFrameCallback decode loop (sync to camera frames, ~33ms)
-//  6. ROI center crop for native path to reduce work and improve hit rate
-//  7. Result debounce to prevent duplicate triggers
-// Public API unchanged: start, pause, resume, stop, flipCamera, toggleTorch
+// scanner.js — V1_7
+// V1_7 optimizations:
+//  1. Native detect() directly on video element (skip canvas → faster)
+//  2. Multi-barcode: detect ALL codes, show floating labels, tap to select
+//  3. Multi-ROI strip scanning for ZXing (top/mid/bot strips to find multiple codes)
+//  4. Enhanced contrast fallback pass for hard-to-read barcodes
+//  5. ~30fps native / ~16fps ZXing scan loop
+//  6. Larger scan frame (CSS), wider ROI crop
 
 const Scanner = (() => {
-  let reader = null;
   let nativeDetector = null;
   let useNative = false;
   let currentStream = null;
@@ -18,18 +15,14 @@ const Scanner = (() => {
   let scanning = false;
   let torchOn = false;
   let streamAlive = false;
-  let rvfcHandle = 0;
-  let lastText = null;
-  let lastTime = 0;
+  let rafId = 0;
+  let lastSingleText = null;
+  let lastSingleTime = 0;
   let workCanvas = null;
   let workCtx = null;
+  let enhCanvas = null;
+  let enhCtx = null;
 
-  const ZX_FORMATS = () => {
-    const F = ZXing.BarcodeFormat;
-    return [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
-            F.CODE_128, F.CODE_39, F.ITF, F.QR_CODE,
-            F.DATA_MATRIX, F.PDF_417];
-  };
   const NATIVE_FORMATS = [
     'ean_13','ean_8','upc_a','upc_e',
     'code_128','code_39','itf',
@@ -55,188 +48,349 @@ const Scanner = (() => {
     return null;
   }
 
-  function flashSuccess() {
-    const overlay = document.getElementById('scanOverlay');
-    if (!overlay) return;
-    overlay.style.background = 'rgba(39,174,96,0.35)';
-    setTimeout(() => { overlay.style.background = 'rgba(0,0,0,0.4)'; }, 350);
+  function ensureCanvas(tag, w, h) {
+    if (tag === 'work') {
+      if (!workCanvas) { workCanvas = document.createElement('canvas'); workCtx = workCanvas.getContext('2d', { willReadFrequently: true }); }
+      if (workCanvas.width !== w) workCanvas.width = w;
+      if (workCanvas.height !== h) workCanvas.height = h;
+      return { c: workCanvas, x: workCtx };
+    }
+    if (!enhCanvas) { enhCanvas = document.createElement('canvas'); enhCtx = enhCanvas.getContext('2d', { willReadFrequently: true }); }
+    if (enhCanvas.width !== w) enhCanvas.width = w;
+    if (enhCanvas.height !== h) enhCanvas.height = h;
+    return { c: enhCanvas, x: enhCtx };
   }
 
-  function handleHit(text, fmtName) {
-    const now = Date.now();
-    if (text === lastText && now - lastTime < 1500) return;
-    lastText = text; lastTime = now;
-    scanning = false;
-    if (navigator.vibrate) navigator.vibrate(200);
-    showResult(text, fmtName);
+  function enhanceContrast(srcCanvas) {
+    const w = srcCanvas.width, h = srcCanvas.height;
+    const { c, x } = ensureCanvas('enh', w, h);
+    x.filter = 'contrast(1.6) brightness(1.1)';
+    x.drawImage(srcCanvas, 0, 0);
+    x.filter = 'none';
+    return c;
   }
+
+  function flashSuccess() {
+    const ov = document.getElementById('scanOverlay');
+    if (!ov) return;
+    ov.style.background = 'rgba(39,174,96,0.35)';
+    setTimeout(() => { ov.style.background = 'rgba(0,0,0,0.4)'; }, 350);
+  }
+
+  // ── Video→screen coordinate mapping (object-fit:cover) ──
+
+  function v2s(video, bbox) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const r = video.getBoundingClientRect();
+    const va = vw / vh, ea = r.width / r.height;
+    let sc, ox = 0, oy = 0;
+    if (va > ea) { sc = r.height / vh; ox = (r.width - vw * sc) / 2; }
+    else { sc = r.width / vw; oy = (r.height - vh * sc) / 2; }
+    return { x: bbox.x * sc + ox, y: bbox.y * sc + oy, w: bbox.width * sc, h: bbox.height * sc };
+  }
+
+  function bbFromPts(pts) {
+    if (!pts || pts.length < 2) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of pts) {
+      const px = p.x !== undefined ? p.x : p.getX();
+      const py = p.y !== undefined ? p.y : p.getY();
+      if (px < x0) x0 = px; if (py < y0) y0 = py;
+      if (px > x1) x1 = px; if (py > y1) y1 = py;
+    }
+    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  }
+
+  // ── Multi-barcode overlay ──
+
+  function renderLabels(codes, video) {
+    const el = document.getElementById('multiCodeOverlay');
+    if (!el) return;
+    el.innerHTML = '';
+    if (!codes || !codes.length) return;
+    codes.forEach(code => {
+      const pos = code.sp;
+      if (!pos) return;
+      const lbl = document.createElement('div');
+      lbl.className = 'multi-code-label';
+      lbl.style.left = (pos.x + pos.w / 2) + 'px';
+      lbl.style.top = pos.y + 'px';
+      lbl.style.maxWidth = Math.max(pos.w, 140) + 'px';
+      const short = code.text.length > 22 ? code.text.slice(0, 20) + '…' : code.text;
+      lbl.innerHTML = '<span class="mcl-fmt">' + code.fmt.replace(/_/g, '-') + '</span><span class="mcl-text">' + short + '</span>';
+      lbl.addEventListener('click', e => { e.stopPropagation(); scanning = false; showResult(code.text, code.fmt); });
+      el.appendChild(lbl);
+    });
+  }
+  function clearLabels() { const el = document.getElementById('multiCodeOverlay'); if (el) el.innerHTML = ''; }
+
+  // ── Result display ──
 
   function showResult(content, fmt) {
-    const cat = fmtCat(fmt);
-    const extra = detectExtra(content, fmt);
+    const cat = fmtCat(fmt), extra = detectExtra(content, fmt);
     const isURL = /^https?:\/\//i.test(content);
-
     flashSuccess();
+    if (navigator.vibrate) navigator.vibrate(100);
+    clearLabels();
 
     document.getElementById('resultContent').textContent = content;
     const meta = document.getElementById('resultMeta');
     meta.innerHTML = '';
-    const addTag = (cls, txt) => {
-      const s = document.createElement('span');
-      s.className = 'result-tag ' + cls; s.textContent = txt; meta.appendChild(s);
-    };
-    addTag(cat === '2D' ? 'tag-2d' : 'tag-1d', fmt.replace(/_/g,'-'));
-    addTag('tag-time', new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'}));
-    if (extra) addTag('tag-extra', extra);
+    const tag = (cls, txt) => { const s = document.createElement('span'); s.className = 'result-tag ' + cls; s.textContent = txt; meta.appendChild(s); };
+    tag(cat === '2D' ? 'tag-2d' : 'tag-1d', fmt.replace(/_/g, '-'));
+    tag('tag-time', new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' }));
+    if (extra) tag('tag-extra', extra);
 
     const btnUrl = document.getElementById('btnOpenUrl');
     btnUrl.style.display = isURL ? '' : 'none';
-    if (isURL) btnUrl.onclick = () => window.open(content,'_blank');
+    if (isURL) btnUrl.onclick = () => window.open(content, '_blank');
 
-    document.getElementById('btnCopy').onclick = () => {
-      navigator.clipboard.writeText(content).catch(()=>{});
-      UI.toast('已複製');
-    };
+    document.getElementById('btnCopy').onclick = () => { navigator.clipboard.writeText(content).catch(() => {}); UI.toast('已複製'); };
     const btnSave = document.getElementById('btnSaveScan');
     btnSave.disabled = false;
     btnSave.onclick = async () => {
-      await DB.add({ content, format: extra||fmt, category: cat, source: 'scan' });
+      await DB.add({ content, format: extra || fmt, category: cat, source: 'scan' });
       UI.toast('已儲存'); btnSave.disabled = true;
     };
     document.getElementById('btnContinueScan').onclick = () => {
       document.getElementById('scanResultWrap').style.display = 'none';
-      lastText = null;
-      scanning = true;
+      lastSingleText = null; scanning = true;
     };
     document.getElementById('scanResultWrap').style.display = '';
   }
 
+  function singleHit(text, fmt) {
+    const now = Date.now();
+    if (text === lastSingleText && now - lastSingleTime < 1500) return;
+    lastSingleText = text; lastSingleTime = now;
+    scanning = false;
+    if (navigator.vibrate) navigator.vibrate(200);
+    showResult(text, fmt);
+  }
+
+  // ── Native BarcodeDetector loop ──
+
+  function nativeLoop(video) {
+    let last = 0;
+    const INTV = 33;
+    const tick = async () => {
+      if (!streamAlive) return;
+      if (scanning && video.readyState >= 2 && nativeDetector) {
+        const now = performance.now();
+        if (now - last >= INTV) {
+          last = now;
+          try {
+            let codes = await nativeDetector.detect(video);
+            if (!codes || codes.length === 0) codes = await nativeEnhancedCrop(video);
+            if (codes && codes.length > 0) processNativeCodes(codes, video);
+            else clearLabels();
+          } catch (_) { }
+        }
+      }
+      if (streamAlive) rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+  }
+
+  async function nativeEnhancedCrop(video) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const cw = Math.floor(vw * 0.85), ch = Math.floor(vh * 0.65);
+    const cx = Math.floor((vw - cw) / 2), cy = Math.floor((vh - ch) / 2);
+    const { c, x } = ensureCanvas('work', cw, ch);
+    x.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
+    const enh = enhanceContrast(c);
+    try {
+      const codes = await nativeDetector.detect(enh);
+      if (codes && codes.length) {
+        return codes.map(cd => {
+          const bb = cd.boundingBox;
+          if (bb) {
+            const remapped = { x: bb.x + cx, y: bb.y + cy, width: bb.width, height: bb.height };
+            return Object.assign({}, cd, { _remappedBB: remapped });
+          }
+          return cd;
+        });
+      }
+    } catch (_) { }
+    return null;
+  }
+
+  function processNativeCodes(codes, video) {
+    if (codes.length === 1) {
+      singleHit(codes[0].rawValue, NATIVE_TO_ZX[codes[0].format] || codes[0].format.toUpperCase());
+    } else {
+      const mapped = codes.map(c => {
+        const bb = c._remappedBB || c.boundingBox || (c.cornerPoints ? bbFromPts(c.cornerPoints) : null);
+        return { text: c.rawValue, fmt: NATIVE_TO_ZX[c.format] || c.format.toUpperCase(), sp: bb ? v2s(video, bb) : null };
+      });
+      renderLabels(mapped, video);
+    }
+  }
+
+  // ── ZXing fallback loop ──
+
+  function zxLoop(video) {
+    const hints = new Map();
+    const F = ZXing.BarcodeFormat;
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
+      F.CODE_128, F.CODE_39, F.ITF, F.QR_CODE,
+      F.DATA_MATRIX, F.PDF_417, F.CODABAR
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    try { hints.set(ZXing.DecodeHintType.ALSO_INVERTED, true); } catch (_) { }
+
+    let last = 0;
+    const INTV = 60;
+
+    const tick = async () => {
+      if (!streamAlive) return;
+      if (scanning && video.readyState >= 2) {
+        const now = performance.now();
+        if (now - last >= INTV) {
+          last = now;
+          const vw = video.videoWidth, vh = video.videoHeight;
+          if (vw && vh) {
+            const strips = [
+              { sx: vw * 0.10, sy: vh * 0.20, sw: vw * 0.80, sh: vh * 0.60 },
+              { sx: vw * 0.05, sy: vh * 0.08, sw: vw * 0.90, sh: vh * 0.32 },
+              { sx: vw * 0.05, sy: vh * 0.55, sw: vw * 0.90, sh: vh * 0.32 },
+              { sx: 0, sy: 0, sw: vw, sh: vh }
+            ];
+            const found = new Map();
+
+            for (let i = 0; i < strips.length; i++) {
+              const s = strips[i];
+              const sx = Math.floor(s.sx), sy = Math.floor(s.sy), sw = Math.floor(s.sw), sh = Math.floor(s.sh);
+              const res = zxDecode(video, sx, sy, sw, sh, hints);
+              if (res) {
+                if (!found.has(res.text)) {
+                  const pts = res.result.getResultPoints();
+                  let bb = null;
+                  if (pts && pts.length >= 2) {
+                    const raw = bbFromPts(pts);
+                    bb = { x: raw.x + sx, y: raw.y + sy, width: raw.width, height: raw.height };
+                  }
+                  found.set(res.text, { text: res.text, fmt: res.fmt, bb });
+                }
+              }
+              if (found.size === 1 && i === 0) break;
+              if (found.size >= 2) break;
+            }
+
+            if (found.size === 0) {
+              const cx = Math.floor(vw * 0.10), cy = Math.floor(vh * 0.20);
+              const cw = Math.floor(vw * 0.80), ch = Math.floor(vh * 0.60);
+              const { c: wc, x: wx } = ensureCanvas('work', cw, ch);
+              wx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
+              const enh = enhanceContrast(wc);
+              const res = zxDecodeCanvas(enh, hints);
+              if (res) found.set(res.text, { text: res.text, fmt: res.fmt, bb: null });
+            }
+
+            if (found.size === 1) {
+              singleHit(found.values().next().value.text, found.values().next().value.fmt);
+            } else if (found.size > 1) {
+              const mapped = [...found.values()].map(c => ({
+                text: c.text, fmt: c.fmt,
+                sp: c.bb ? v2s(video, c.bb) : null
+              }));
+              renderLabels(mapped, video);
+            } else {
+              clearLabels();
+            }
+          }
+        }
+      }
+      if (streamAlive) rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function zxDecode(video, sx, sy, sw, sh, hints) {
+    const { c, x } = ensureCanvas('work', sw, sh);
+    x.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+    return zxDecodeCanvas(c, hints);
+  }
+
+  function zxDecodeCanvas(canvas, hints) {
+    try {
+      const lum = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+      const bin = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
+      const reader = new ZXing.MultiFormatReader();
+      const result = reader.decode(bin, hints);
+      if (result) return { text: result.getText(), fmt: fmtStr(result.getBarcodeFormat()), result };
+    } catch (_) { }
+    return null;
+  }
+
+  // ── Camera management ──
+
   function clearStream() {
     scanning = false; streamAlive = false; torchOn = false;
-    rvfcHandle = 0;
-    if (reader) { try { reader.reset(); } catch(_){} reader = null; }
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
-    const video = document.getElementById('scan-video');
-    if (video) video.srcObject = null;
+    const v = document.getElementById('scan-video');
+    if (v) v.srcObject = null;
+    clearLabels();
   }
 
   async function tuneCamera(track) {
     if (!track || !track.getCapabilities) return;
     const caps = track.getCapabilities();
-    const advanced = [];
-    if (caps.focusMode && caps.focusMode.includes('continuous'))
-      advanced.push({ focusMode: 'continuous' });
-    if (caps.exposureMode && caps.exposureMode.includes('continuous'))
-      advanced.push({ exposureMode: 'continuous' });
-    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous'))
-      advanced.push({ whiteBalanceMode: 'continuous' });
-    if (advanced.length) {
-      try { await track.applyConstraints({ advanced }); } catch(_){}
-    }
-  }
-
-  function startNativeLoop(video) {
-    if (!workCanvas) {
-      workCanvas = document.createElement('canvas');
-      workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
-    }
-    const tick = async () => {
-      if (!streamAlive) return;
-      if (scanning && video.readyState >= 2 && nativeDetector) {
-        try {
-          const vw = video.videoWidth, vh = video.videoHeight;
-          if (vw && vh) {
-            // ROI center crop: 70% width, 50% height (matches typical scan box area)
-            const cw = Math.floor(vw * 0.70);
-            const ch = Math.floor(vh * 0.50);
-            const cx = Math.floor((vw - cw) / 2);
-            const cy = Math.floor((vh - ch) / 2);
-            if (workCanvas.width !== cw) workCanvas.width = cw;
-            if (workCanvas.height !== ch) workCanvas.height = ch;
-            workCtx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
-            const codes = await nativeDetector.detect(workCanvas);
-            if (codes && codes.length > 0) {
-              const c = codes[0];
-              handleHit(c.rawValue, NATIVE_TO_ZX[c.format] || c.format.toUpperCase());
-            }
-          }
-        } catch(_){}
-      }
-      if (!streamAlive) return;
-      if (video.requestVideoFrameCallback) {
-        rvfcHandle = video.requestVideoFrameCallback(tick);
-      } else {
-        rvfcHandle = requestAnimationFrame(tick);
-      }
-    };
-    tick();
+    const adv = [];
+    if (caps.focusMode && caps.focusMode.includes('continuous')) adv.push({ focusMode: 'continuous' });
+    if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.push({ exposureMode: 'continuous' });
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.push({ whiteBalanceMode: 'continuous' });
+    if (adv.length) try { await track.applyConstraints({ advanced: adv }); } catch (_) { }
   }
 
   async function startCamera(deviceId) {
     clearStream();
-    await new Promise(r => setTimeout(r, 120));
-
+    await new Promise(r => setTimeout(r, 80));
     const video = document.getElementById('scan-video');
 
-    // Detect native BarcodeDetector once
     if (!nativeDetector && 'BarcodeDetector' in window) {
       try {
-        const supported = await BarcodeDetector.getSupportedFormats();
-        const usable = NATIVE_FORMATS.filter(f => supported.includes(f));
-        if (usable.length >= 5) {
-          nativeDetector = new BarcodeDetector({ formats: usable });
+        const sup = await BarcodeDetector.getSupportedFormats();
+        const ok = NATIVE_FORMATS.filter(f => sup.includes(f));
+        if (ok.length >= 5) {
+          nativeDetector = new BarcodeDetector({ formats: ok });
           useNative = true;
-          console.log('[Scanner] Using native BarcodeDetector:', usable.join(','));
         }
-      } catch(_){}
+      } catch (_) { }
     }
 
     try {
-      const baseVideo = deviceId
-        ? { deviceId: { exact: deviceId },
-            width: { ideal: 1920 }, height: { ideal: 1080 },
-            frameRate: { ideal: 30 } }
-        : { facingMode: { ideal: 'environment' },
-            width: { ideal: 1920 }, height: { ideal: 1080 },
-            frameRate: { ideal: 30 } };
-      try {
-        currentStream = await navigator.mediaDevices.getUserMedia({ video: baseVideo });
-      } catch(e1) {
-        const fallback = deviceId
-          ? { deviceId: { exact: deviceId }, width:{ideal:1280}, height:{ideal:720} }
-          : { facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} };
-        currentStream = await navigator.mediaDevices.getUserMedia({ video: fallback });
+      const vc = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
+        : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+      try { currentStream = await navigator.mediaDevices.getUserMedia({ video: vc }); }
+      catch (_) {
+        const fb = deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } };
+        currentStream = await navigator.mediaDevices.getUserMedia({ video: fb });
       }
 
       const track = currentStream.getVideoTracks()[0];
       currentDeviceId = (track.getSettings ? track.getSettings().deviceId : null) || deviceId || null;
-
       video.srcObject = currentStream;
-      video.setAttribute('playsinline','true');
+      video.setAttribute('playsinline', 'true');
       video.muted = true;
       await video.play();
-
       tuneCamera(track);
 
-      streamAlive = true;
-      scanning = true;
-      lastText = null; lastTime = 0;
+      streamAlive = true; scanning = true;
+      lastSingleText = null; lastSingleTime = 0;
       document.getElementById('scanError').style.display = 'none';
       document.getElementById('scanOverlay').style.display = '';
+      document.getElementById('scanResultWrap').style.display = 'none';
 
-      if (useNative) {
-        startNativeLoop(video);
-      } else {
-        const hints = new Map();
-        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, ZX_FORMATS());
-        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-        try { hints.set(ZXing.DecodeHintType.ALSO_INVERTED, true); } catch(_){}
-        reader = new ZXing.BrowserMultiFormatReader(hints, 100);
-        reader.decodeFromStream(currentStream, video, (result) => {
-          if (!scanning || !result) return;
-          handleHit(result.getText(), fmtStr(result.getBarcodeFormat()));
-        });
-      }
+      if (useNative) nativeLoop(video);
+      else zxLoop(video);
     } catch (err) {
       console.error('Camera:', err);
       document.getElementById('scanError').style.display = 'flex';
@@ -244,38 +398,30 @@ const Scanner = (() => {
     }
   }
 
-  function pause() { scanning = false; }
-
+  function pause() { scanning = false; clearLabels(); }
   function resume() {
     if (streamAlive && currentStream) {
       document.getElementById('scanResultWrap').style.display = 'none';
       document.getElementById('scanError').style.display = 'none';
       document.getElementById('scanOverlay').style.display = '';
-      lastText = null;
-      scanning = true;
-    } else {
-      return startCamera(currentDeviceId);
-    }
+      lastSingleText = null; scanning = true;
+    } else { return startCamera(currentDeviceId); }
   }
-
   function stop() { clearStream(); }
 
   async function flipCamera() {
-    let devices = [];
-    try { const all = await navigator.mediaDevices.enumerateDevices(); devices = all.filter(d => d.kind === 'videoinput'); } catch(_){}
-    if (devices.length < 2) { UI.toast('此裝置只有一個鏡頭'); return; }
-    const idx = devices.findIndex(d => d.deviceId === currentDeviceId);
-    await startCamera(devices[(idx + 1) % devices.length].deviceId);
+    let devs = [];
+    try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch (_) { }
+    if (devs.length < 2) { UI.toast('此裝置只有一個鏡頭'); return; }
+    const i = devs.findIndex(d => d.deviceId === currentDeviceId);
+    await startCamera(devs[(i + 1) % devs.length].deviceId);
   }
 
   async function toggleTorch() {
     if (!currentStream) return;
     const track = currentStream.getVideoTracks()[0];
-    try {
-      torchOn = !torchOn;
-      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
-      document.getElementById('btnTorch').classList.toggle('active', torchOn);
-    } catch { UI.toast('此裝置不支援閃光燈'); torchOn = false; }
+    try { torchOn = !torchOn; await track.applyConstraints({ advanced: [{ torch: torchOn }] }); document.getElementById('btnTorch').classList.toggle('active', torchOn); }
+    catch { UI.toast('此裝置不支援閃光燈'); torchOn = false; }
   }
 
   return { start: startCamera, pause, resume, stop, flipCamera, toggleTorch };

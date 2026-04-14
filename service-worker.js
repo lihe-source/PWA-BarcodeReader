@@ -1,4 +1,4 @@
-const CACHE_NAME = 'barcodepro-V1_6';
+const CACHE_NAME = 'barcodepro-V1_7';
 const ASSETS = [
   './', './index.html', './app.js', './scanner.js',
   './generator.js', './history.js', './db.js', './ui.js',
