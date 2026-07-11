@@ -1,428 +1,713 @@
-// scanner.js — V1_7
-// V1_7 optimizations:
-//  1. Native detect() directly on video element (skip canvas → faster)
-//  2. Multi-barcode: detect ALL codes, show floating labels, tap to select
-//  3. Multi-ROI strip scanning for ZXing (top/mid/bot strips to find multiple codes)
-//  4. Enhanced contrast fallback pass for hard-to-read barcodes
-//  5. ~30fps native / ~16fps ZXing scan loop
-//  6. Larger scan frame (CSS), wider ROI crop
-
 const Scanner = (() => {
-  let nativeDetector = null;
-  let useNative = false;
-  let currentStream = null;
-  let currentDeviceId = null;
-  let scanning = false;
-  let torchOn = false;
-  let streamAlive = false;
-  let rafId = 0;
-  let lastSingleText = null;
-  let lastSingleTime = 0;
-  let workCanvas = null;
-  let workCtx = null;
-  let enhCanvas = null;
-  let enhCtx = null;
-
   const NATIVE_FORMATS = [
-    'ean_13','ean_8','upc_a','upc_e',
-    'code_128','code_39','itf',
-    'qr_code','data_matrix','pdf417'
+    'aztec', 'codabar', 'code_39', 'code_93', 'code_128',
+    'data_matrix', 'ean_8', 'ean_13', 'itf', 'pdf417',
+    'qr_code', 'upc_a', 'upc_e'
   ];
-  const NATIVE_TO_ZX = {
-    'ean_13':'EAN_13','ean_8':'EAN_8','upc_a':'UPC_A','upc_e':'UPC_E',
-    'code_128':'CODE_128','code_39':'CODE_39','itf':'ITF',
-    'qr_code':'QR_CODE','data_matrix':'DATA_MATRIX','pdf417':'PDF_417'
+
+  const NATIVE_FORMAT_LABELS = {
+    aztec: 'AZTEC', codabar: 'CODABAR', code_39: 'CODE_39', code_93: 'CODE_93',
+    code_128: 'CODE_128', data_matrix: 'DATA_MATRIX', ean_8: 'EAN_8',
+    ean_13: 'EAN_13', itf: 'ITF', pdf417: 'PDF_417', qr_code: 'QR_CODE',
+    upc_a: 'UPC_A', upc_e: 'UPC_E'
   };
 
-  function fmtStr(num) {
-    return Object.keys(ZXing.BarcodeFormat).find(k => ZXing.BarcodeFormat[k] === num) || 'UNKNOWN';
+  let video;
+  let canvas;
+  let context;
+  let stream = null;
+  let videoTrack = null;
+  let detector = null;
+  let engine = 'none';
+  let running = false;
+  let scanning = false;
+  let processing = false;
+  let scheduledId = 0;
+  let usingVideoFrameCallback = false;
+  let currentDeviceId = '';
+  let facingMode = 'environment';
+  let torchOn = false;
+  let wakeLock = null;
+  let lastScanAt = 0;
+  let candidate = { value: '', format: '', hits: 0, at: 0 };
+  let lastResult = null;
+  let initialized = false;
+  let lifecycleToken = 0;
+
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    video = document.getElementById('scanVideo');
+    canvas = document.getElementById('scanCanvas');
+    context = canvas.getContext('2d', { willReadFrequently: true });
+
+    document.getElementById('cameraStartOverlay').addEventListener('click', () => start());
+    document.getElementById('retryCameraBtn').addEventListener('click', () => start());
+    document.getElementById('flipCameraBtn').addEventListener('click', flipCamera);
+    document.getElementById('torchBtn').addEventListener('click', toggleTorch);
+    document.getElementById('zoomRange').addEventListener('input', onZoomInput);
+    document.getElementById('continueScanBtn').addEventListener('click', continueScan);
+    document.getElementById('copyScanBtn').addEventListener('click', () => lastResult && Utils.copyText(lastResult.value));
+    document.getElementById('shareScanBtn').addEventListener('click', () => {
+      if (!lastResult) return;
+      Utils.shareText('條碼讀值', lastResult.value, lastResult.url);
+    });
+    document.getElementById('openScanUrlBtn').addEventListener('click', () => lastResult && Utils.openUrl(lastResult.url));
+    document.getElementById('saveScanBtn').addEventListener('click', saveLastResult);
+
+    video.addEventListener('loadedmetadata', () => setCameraStatus('相機已啟動，請對準條碼'));
+    video.addEventListener('click', refocus);
+    document.addEventListener('visibilitychange', handleVisibility);
   }
-  function fmtCat(s) {
-    return ['QR_CODE','DATA_MATRIX','PDF_417','AZTEC'].includes(s) ? '2D' : '1D';
-  }
-  function detectExtra(content, fmt) {
-    if (fmt === 'EAN_13') {
-      if (/^97[89]/.test(content)) return 'ISBN';
-      if (/^977/.test(content)) return 'ISSN';
+
+  async function initEngine() {
+    detector = null;
+    engine = 'none';
+    setEnginePill('載入辨識引擎…');
+
+    if ('BarcodeDetector' in window) {
+      try {
+        const supported = typeof BarcodeDetector.getSupportedFormats === 'function'
+          ? await BarcodeDetector.getSupportedFormats()
+          : NATIVE_FORMATS;
+        const formats = NATIVE_FORMATS.filter(format => supported.includes(format));
+        if (formats.length) {
+          detector = new BarcodeDetector({ formats });
+          engine = 'native';
+          setEnginePill('原生高速辨識', 'ready');
+          return;
+        }
+      } catch (error) {
+        console.warn('BarcodeDetector initialization failed:', error);
+      }
     }
-    return null;
-  }
 
-  function ensureCanvas(tag, w, h) {
-    if (tag === 'work') {
-      if (!workCanvas) { workCanvas = document.createElement('canvas'); workCtx = workCanvas.getContext('2d', { willReadFrequently: true }); }
-      if (workCanvas.width !== w) workCanvas.width = w;
-      if (workCanvas.height !== h) workCanvas.height = h;
-      return { c: workCanvas, x: workCtx };
+    if (!window.ZXing?.MultiFormatReader) await waitForGlobal('ZXing', 8000);
+    if (window.ZXing?.MultiFormatReader) {
+      engine = 'zxing';
+      setEnginePill('ZXing 備援', 'fallback');
+      return;
     }
-    if (!enhCanvas) { enhCanvas = document.createElement('canvas'); enhCtx = enhCanvas.getContext('2d', { willReadFrequently: true }); }
-    if (enhCanvas.width !== w) enhCanvas.width = w;
-    if (enhCanvas.height !== h) enhCanvas.height = h;
-    return { c: enhCanvas, x: enhCtx };
+
+    setEnginePill('無可用引擎', 'fallback');
   }
 
-  function enhanceContrast(srcCanvas) {
-    const w = srcCanvas.width, h = srcCanvas.height;
-    const { c, x } = ensureCanvas('enh', w, h);
-    x.filter = 'contrast(1.6) brightness(1.1)';
-    x.drawImage(srcCanvas, 0, 0);
-    x.filter = 'none';
-    return c;
-  }
 
-  function flashSuccess() {
-    const ov = document.getElementById('scanOverlay');
-    if (!ov) return;
-    ov.style.background = 'rgba(39,174,96,0.35)';
-    setTimeout(() => { ov.style.background = 'rgba(0,0,0,0.4)'; }, 350);
-  }
-
-  // ── Video→screen coordinate mapping (object-fit:cover) ──
-
-  function v2s(video, bbox) {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return null;
-    const r = video.getBoundingClientRect();
-    const va = vw / vh, ea = r.width / r.height;
-    let sc, ox = 0, oy = 0;
-    if (va > ea) { sc = r.height / vh; ox = (r.width - vw * sc) / 2; }
-    else { sc = r.width / vw; oy = (r.height - vh * sc) / 2; }
-    return { x: bbox.x * sc + ox, y: bbox.y * sc + oy, w: bbox.width * sc, h: bbox.height * sc };
-  }
-
-  function bbFromPts(pts) {
-    if (!pts || pts.length < 2) return null;
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (const p of pts) {
-      const px = p.x !== undefined ? p.x : p.getX();
-      const py = p.y !== undefined ? p.y : p.getY();
-      if (px < x0) x0 = px; if (py < y0) y0 = py;
-      if (px > x1) x1 = px; if (py > y1) y1 = py;
-    }
-    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
-  }
-
-  // ── Multi-barcode overlay ──
-
-  function renderLabels(codes, video) {
-    const el = document.getElementById('multiCodeOverlay');
-    if (!el) return;
-    el.innerHTML = '';
-    if (!codes || !codes.length) return;
-    codes.forEach(code => {
-      const pos = code.sp;
-      if (!pos) return;
-      const lbl = document.createElement('div');
-      lbl.className = 'multi-code-label';
-      lbl.style.left = (pos.x + pos.w / 2) + 'px';
-      lbl.style.top = pos.y + 'px';
-      lbl.style.maxWidth = Math.max(pos.w, 140) + 'px';
-      const short = code.text.length > 22 ? code.text.slice(0, 20) + '…' : code.text;
-      lbl.innerHTML = '<span class="mcl-fmt">' + code.fmt.replace(/_/g, '-') + '</span><span class="mcl-text">' + short + '</span>';
-      lbl.addEventListener('click', e => { e.stopPropagation(); scanning = false; showResult(code.text, code.fmt); });
-      el.appendChild(lbl);
+  function waitForGlobal(name, timeoutMs) {
+    if (window[name]) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const startedAt = Date.now();
+      const timer = setInterval(() => {
+        if (window[name]) {
+          clearInterval(timer);
+          resolve(true);
+        } else if (Date.now() - startedAt >= timeoutMs) {
+          clearInterval(timer);
+          resolve(false);
+        }
+      }, 80);
     });
   }
-  function clearLabels() { const el = document.getElementById('multiCodeOverlay'); if (el) el.innerHTML = ''; }
 
-  // ── Result display ──
+  async function start(options = {}) {
+    init();
+    const token = ++lifecycleToken;
+    await stop({ keepResult: true, preserveToken: true });
+    hidePermissionError();
+    setCameraStatus('正在啟動相機…');
+    document.getElementById('cameraStartOverlay').hidden = true;
+    document.getElementById('scanResultCard').hidden = true;
+    document.getElementById('detectedBox').hidden = true;
+    resetCandidate();
 
-  function showResult(content, fmt) {
-    const cat = fmtCat(fmt), extra = detectExtra(content, fmt);
-    const isURL = /^https?:\/\//i.test(content);
-    flashSuccess();
-    if (navigator.vibrate) navigator.vibrate(100);
-    clearLabels();
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showPermissionError('此瀏覽器不支援即時相機。請改用 Safari／Chrome，並從 HTTPS 或 GitHub Pages 開啟。');
+      return false;
+    }
 
-    document.getElementById('resultContent').textContent = content;
-    const meta = document.getElementById('resultMeta');
-    meta.innerHTML = '';
-    const tag = (cls, txt) => { const s = document.createElement('span'); s.className = 'result-tag ' + cls; s.textContent = txt; meta.appendChild(s); };
-    tag(cat === '2D' ? 'tag-2d' : 'tag-1d', fmt.replace(/_/g, '-'));
-    tag('tag-time', new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' }));
-    if (extra) tag('tag-extra', extra);
+    const enginePromise = initEngine();
 
-    const btnUrl = document.getElementById('btnOpenUrl');
-    btnUrl.style.display = isURL ? '' : 'none';
-    if (isURL) btnUrl.onclick = () => window.open(content, '_blank');
-
-    document.getElementById('btnCopy').onclick = () => { navigator.clipboard.writeText(content).catch(() => {}); UI.toast('已複製'); };
-    const btnSave = document.getElementById('btnSaveScan');
-    btnSave.disabled = false;
-    btnSave.onclick = async () => {
-      await DB.add({ content, format: extra || fmt, category: cat, source: 'scan' });
-      UI.toast('已儲存'); btnSave.disabled = true;
-    };
-    document.getElementById('btnContinueScan').onclick = () => {
-      document.getElementById('scanResultWrap').style.display = 'none';
-      lastSingleText = null; scanning = true;
-    };
-    document.getElementById('scanResultWrap').style.display = '';
-  }
-
-  function singleHit(text, fmt) {
-    const now = Date.now();
-    if (text === lastSingleText && now - lastSingleTime < 1500) return;
-    lastSingleText = text; lastSingleTime = now;
-    scanning = false;
-    if (navigator.vibrate) navigator.vibrate(200);
-    showResult(text, fmt);
-  }
-
-  // ── Native BarcodeDetector loop ──
-
-  function nativeLoop(video) {
-    let last = 0;
-    const INTV = 33;
-    const tick = async () => {
-      if (!streamAlive) return;
-      if (scanning && video.readyState >= 2 && nativeDetector) {
-        const now = performance.now();
-        if (now - last >= INTV) {
-          last = now;
-          try {
-            let codes = await nativeDetector.detect(video);
-            if (!codes || codes.length === 0) codes = await nativeEnhancedCrop(video);
-            if (codes && codes.length > 0) processNativeCodes(codes, video);
-            else clearLabels();
-          } catch (_) { }
-        }
+    const requestedDeviceId = options.deviceId || '';
+    const requestedFacingMode = options.facingMode || facingMode || 'environment';
+    const primaryConstraints = {
+      audio: false,
+      video: requestedDeviceId ? {
+        deviceId: { exact: requestedDeviceId },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30, max: 60 }
+      } : {
+        facingMode: { ideal: requestedFacingMode },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30, max: 60 }
       }
-      if (streamAlive) rafId = requestAnimationFrame(tick);
     };
-    rafId = requestAnimationFrame(tick);
-  }
 
-  async function nativeEnhancedCrop(video) {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return null;
-    const cw = Math.floor(vw * 0.85), ch = Math.floor(vh * 0.65);
-    const cx = Math.floor((vw - cw) / 2), cy = Math.floor((vh - ch) / 2);
-    const { c, x } = ensureCanvas('work', cw, ch);
-    x.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
-    const enh = enhanceContrast(c);
     try {
-      const codes = await nativeDetector.detect(enh);
-      if (codes && codes.length) {
-        return codes.map(cd => {
-          const bb = cd.boundingBox;
-          if (bb) {
-            const remapped = { x: bb.x + cx, y: bb.y + cy, width: bb.width, height: bb.height };
-            return Object.assign({}, cd, { _remappedBB: remapped });
-          }
-          return cd;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(primaryConstraints);
+      } catch (firstError) {
+        console.warn('High resolution camera constraint failed:', firstError);
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: requestedDeviceId
+            ? { deviceId: { exact: requestedDeviceId } }
+            : { facingMode: { ideal: requestedFacingMode } }
         });
       }
-    } catch (_) { }
-    return null;
-  }
 
-  function processNativeCodes(codes, video) {
-    if (codes.length === 1) {
-      singleHit(codes[0].rawValue, NATIVE_TO_ZX[codes[0].format] || codes[0].format.toUpperCase());
-    } else {
-      const mapped = codes.map(c => {
-        const bb = c._remappedBB || c.boundingBox || (c.cornerPoints ? bbFromPts(c.cornerPoints) : null);
-        return { text: c.rawValue, fmt: NATIVE_TO_ZX[c.format] || c.format.toUpperCase(), sp: bb ? v2s(video, bb) : null };
-      });
-      renderLabels(mapped, video);
-    }
-  }
-
-  // ── ZXing fallback loop ──
-
-  function zxLoop(video) {
-    const hints = new Map();
-    const F = ZXing.BarcodeFormat;
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
-      F.CODE_128, F.CODE_39, F.ITF, F.QR_CODE,
-      F.DATA_MATRIX, F.PDF_417, F.CODABAR
-    ]);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    try { hints.set(ZXing.DecodeHintType.ALSO_INVERTED, true); } catch (_) { }
-
-    let last = 0;
-    const INTV = 60;
-
-    const tick = async () => {
-      if (!streamAlive) return;
-      if (scanning && video.readyState >= 2) {
-        const now = performance.now();
-        if (now - last >= INTV) {
-          last = now;
-          const vw = video.videoWidth, vh = video.videoHeight;
-          if (vw && vh) {
-            const strips = [
-              { sx: vw * 0.10, sy: vh * 0.20, sw: vw * 0.80, sh: vh * 0.60 },
-              { sx: vw * 0.05, sy: vh * 0.08, sw: vw * 0.90, sh: vh * 0.32 },
-              { sx: vw * 0.05, sy: vh * 0.55, sw: vw * 0.90, sh: vh * 0.32 },
-              { sx: 0, sy: 0, sw: vw, sh: vh }
-            ];
-            const found = new Map();
-
-            for (let i = 0; i < strips.length; i++) {
-              const s = strips[i];
-              const sx = Math.floor(s.sx), sy = Math.floor(s.sy), sw = Math.floor(s.sw), sh = Math.floor(s.sh);
-              const res = zxDecode(video, sx, sy, sw, sh, hints);
-              if (res) {
-                if (!found.has(res.text)) {
-                  const pts = res.result.getResultPoints();
-                  let bb = null;
-                  if (pts && pts.length >= 2) {
-                    const raw = bbFromPts(pts);
-                    bb = { x: raw.x + sx, y: raw.y + sy, width: raw.width, height: raw.height };
-                  }
-                  found.set(res.text, { text: res.text, fmt: res.fmt, bb });
-                }
-              }
-              if (found.size === 1 && i === 0) break;
-              if (found.size >= 2) break;
-            }
-
-            if (found.size === 0) {
-              const cx = Math.floor(vw * 0.10), cy = Math.floor(vh * 0.20);
-              const cw = Math.floor(vw * 0.80), ch = Math.floor(vh * 0.60);
-              const { c: wc, x: wx } = ensureCanvas('work', cw, ch);
-              wx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
-              const enh = enhanceContrast(wc);
-              const res = zxDecodeCanvas(enh, hints);
-              if (res) found.set(res.text, { text: res.text, fmt: res.fmt, bb: null });
-            }
-
-            if (found.size === 1) {
-              singleHit(found.values().next().value.text, found.values().next().value.fmt);
-            } else if (found.size > 1) {
-              const mapped = [...found.values()].map(c => ({
-                text: c.text, fmt: c.fmt,
-                sp: c.bb ? v2s(video, c.bb) : null
-              }));
-              renderLabels(mapped, video);
-            } else {
-              clearLabels();
-            }
-          }
-        }
-      }
-      if (streamAlive) rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
-  }
-
-  function zxDecode(video, sx, sy, sw, sh, hints) {
-    const { c, x } = ensureCanvas('work', sw, sh);
-    x.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
-    return zxDecodeCanvas(c, hints);
-  }
-
-  function zxDecodeCanvas(canvas, hints) {
-    try {
-      const lum = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
-      const bin = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
-      const reader = new ZXing.MultiFormatReader();
-      const result = reader.decode(bin, hints);
-      if (result) return { text: result.getText(), fmt: fmtStr(result.getBarcodeFormat()), result };
-    } catch (_) { }
-    return null;
-  }
-
-  // ── Camera management ──
-
-  function clearStream() {
-    scanning = false; streamAlive = false; torchOn = false;
-    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
-    if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
-    const v = document.getElementById('scan-video');
-    if (v) v.srcObject = null;
-    clearLabels();
-  }
-
-  async function tuneCamera(track) {
-    if (!track || !track.getCapabilities) return;
-    const caps = track.getCapabilities();
-    const adv = [];
-    if (caps.focusMode && caps.focusMode.includes('continuous')) adv.push({ focusMode: 'continuous' });
-    if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.push({ exposureMode: 'continuous' });
-    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.push({ whiteBalanceMode: 'continuous' });
-    if (adv.length) try { await track.applyConstraints({ advanced: adv }); } catch (_) { }
-  }
-
-  async function startCamera(deviceId) {
-    clearStream();
-    await new Promise(r => setTimeout(r, 80));
-    const video = document.getElementById('scan-video');
-
-    if (!nativeDetector && 'BarcodeDetector' in window) {
-      try {
-        const sup = await BarcodeDetector.getSupportedFormats();
-        const ok = NATIVE_FORMATS.filter(f => sup.includes(f));
-        if (ok.length >= 5) {
-          nativeDetector = new BarcodeDetector({ formats: ok });
-          useNative = true;
-        }
-      } catch (_) { }
-    }
-
-    try {
-      const vc = deviceId
-        ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
-        : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
-      try { currentStream = await navigator.mediaDevices.getUserMedia({ video: vc }); }
-      catch (_) {
-        const fb = deviceId
-          ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-          : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } };
-        currentStream = await navigator.mediaDevices.getUserMedia({ video: fb });
-      }
-
-      const track = currentStream.getVideoTracks()[0];
-      currentDeviceId = (track.getSettings ? track.getSettings().deviceId : null) || deviceId || null;
-      video.srcObject = currentStream;
+      videoTrack = stream.getVideoTracks()[0] || null;
+      const settings = videoTrack?.getSettings?.() || {};
+      currentDeviceId = settings.deviceId || requestedDeviceId;
+      facingMode = settings.facingMode || requestedFacingMode;
+      video.srcObject = stream;
       video.setAttribute('playsinline', 'true');
       video.muted = true;
       await video.play();
-      tuneCamera(track);
-
-      streamAlive = true; scanning = true;
-      lastSingleText = null; lastSingleTime = 0;
-      document.getElementById('scanError').style.display = 'none';
-      document.getElementById('scanOverlay').style.display = '';
-      document.getElementById('scanResultWrap').style.display = 'none';
-
-      if (useNative) nativeLoop(video);
-      else zxLoop(video);
-    } catch (err) {
-      console.error('Camera:', err);
-      document.getElementById('scanError').style.display = 'flex';
-      document.getElementById('scanOverlay').style.display = 'none';
+      await tuneTrack(videoTrack);
+      configureZoom(videoTrack);
+      await enginePromise;
+      if (token !== lifecycleToken) {
+        currentStreamTracksStop();
+        return false;
+      }
+      if (engine === 'none') {
+        throw new Error('條碼解碼元件未載入，請確認網路連線後重新整理。');
+      }
+      running = true;
+      scanning = true;
+      lastScanAt = 0;
+      await requestWakeLock();
+      scheduleLoop();
+      setCameraStatus('相機已啟動，請對準條碼');
+      return true;
+    } catch (error) {
+      console.error('Camera start error:', error);
+      if (token === lifecycleToken) {
+        currentStreamTracksStop();
+        const message = cameraErrorMessage(error);
+        showPermissionError(message);
+        document.getElementById('cameraStartOverlay').hidden = false;
+      }
+      return false;
     }
   }
 
-  function pause() { scanning = false; clearLabels(); }
-  function resume() {
-    if (streamAlive && currentStream) {
-      document.getElementById('scanResultWrap').style.display = 'none';
-      document.getElementById('scanError').style.display = 'none';
-      document.getElementById('scanOverlay').style.display = '';
-      lastSingleText = null; scanning = true;
-    } else { return startCamera(currentDeviceId); }
+  async function tuneTrack(track) {
+    if (!track?.getCapabilities || !track.applyConstraints) return;
+    const capabilities = track.getCapabilities();
+    const advanced = [];
+    if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' });
+    }
+    if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes('continuous')) {
+      advanced.push({ exposureMode: 'continuous' });
+    }
+    if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes('continuous')) {
+      advanced.push({ whiteBalanceMode: 'continuous' });
+    }
+    if (advanced.length) {
+      try { await track.applyConstraints({ advanced }); }
+      catch (error) { console.debug('Camera tuning not fully supported:', error); }
+    }
   }
-  function stop() { clearStream(); }
+
+  function configureZoom(track) {
+    const panel = document.getElementById('zoomPanel');
+    const range = document.getElementById('zoomRange');
+    const output = document.getElementById('zoomValue');
+    panel.hidden = true;
+    if (!track?.getCapabilities) return;
+    const zoom = track.getCapabilities().zoom;
+    if (!zoom || typeof zoom.min !== 'number' || typeof zoom.max !== 'number' || zoom.max <= zoom.min) return;
+    const current = track.getSettings?.().zoom || zoom.min;
+    range.min = zoom.min;
+    range.max = zoom.max;
+    range.step = zoom.step || 0.1;
+    range.value = current;
+    output.value = `${Number(current).toFixed(1)}×`;
+    panel.hidden = false;
+  }
+
+  async function onZoomInput(event) {
+    const value = Number(event.target.value);
+    document.getElementById('zoomValue').value = `${value.toFixed(1)}×`;
+    if (!videoTrack?.applyConstraints) return;
+    try { await videoTrack.applyConstraints({ advanced: [{ zoom: value }] }); }
+    catch { /* ignore devices that expose but reject zoom */ }
+  }
+
+  function scheduleLoop() {
+    cancelScheduledLoop();
+    if (!running) return;
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      usingVideoFrameCallback = true;
+      scheduledId = video.requestVideoFrameCallback(scanFrame);
+    } else {
+      usingVideoFrameCallback = false;
+      scheduledId = requestAnimationFrame(scanFrame);
+    }
+  }
+
+  function cancelScheduledLoop() {
+    if (!scheduledId) return;
+    if (usingVideoFrameCallback && typeof video?.cancelVideoFrameCallback === 'function') {
+      video.cancelVideoFrameCallback(scheduledId);
+    } else {
+      cancelAnimationFrame(scheduledId);
+    }
+    scheduledId = 0;
+  }
+
+  async function scanFrame() {
+    scheduledId = 0;
+    if (!running) return;
+
+    const now = performance.now();
+    const interval = engine === 'native' ? 65 : 105;
+    if (scanning && !processing && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && now - lastScanAt >= interval) {
+      processing = true;
+      lastScanAt = now;
+      try {
+        if (engine === 'native') await scanNativeFrame();
+        else scanZxingFrame();
+      } catch (error) {
+        console.debug('Frame decode failed:', error);
+      } finally {
+        processing = false;
+      }
+    }
+    if (running) scheduleLoop();
+  }
+
+  async function scanNativeFrame() {
+    let codes = [];
+    try { codes = await detector.detect(video); } catch { codes = []; }
+    if (!codes?.length) {
+      // Every few frames, retry with a centered crop and contrast enhancement.
+      if (Math.floor(performance.now() / 400) % 2 === 0) codes = await detectNativeCrop();
+    }
+    if (!codes?.length) {
+      fadeDetectedBox();
+      return;
+    }
+
+    const best = pickBestNativeResult(codes);
+    if (!best?.rawValue) return;
+    showDetectedBox(best._fullBoundingBox || best.boundingBox);
+    acceptCandidate(best.rawValue, NATIVE_FORMAT_LABELS[best.format] || best.format || 'UNKNOWN');
+  }
+
+  async function detectNativeCrop() {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return [];
+    const cropWidth = Math.floor(vw * 0.88);
+    const cropHeight = Math.floor(vh * 0.58);
+    const sourceX = Math.floor((vw - cropWidth) / 2);
+    const sourceY = Math.floor((vh - cropHeight) / 2);
+    canvas.width = Math.min(cropWidth, 1280);
+    canvas.height = Math.round(canvas.width * cropHeight / cropWidth);
+    context.filter = 'contrast(1.25) brightness(1.05)';
+    context.drawImage(video, sourceX, sourceY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+    context.filter = 'none';
+    try {
+      const codes = await detector.detect(canvas);
+      return codes.map(code => {
+        if (!code.boundingBox) return code;
+        const scaleX = cropWidth / canvas.width;
+        const scaleY = cropHeight / canvas.height;
+        code._fullBoundingBox = {
+          x: sourceX + code.boundingBox.x * scaleX,
+          y: sourceY + code.boundingBox.y * scaleY,
+          width: code.boundingBox.width * scaleX,
+          height: code.boundingBox.height * scaleY
+        };
+        return code;
+      });
+    } catch { return []; }
+  }
+
+  function pickBestNativeResult(codes) {
+    if (codes.length === 1) return codes[0];
+    const frameCenterX = video.videoWidth / 2;
+    const frameCenterY = video.videoHeight / 2;
+    return [...codes].sort((a, b) => scoreNative(b) - scoreNative(a))[0];
+
+    function scoreNative(code) {
+      const box = code._fullBoundingBox || code.boundingBox;
+      if (!box) return 0;
+      const area = box.width * box.height;
+      const centerX = box.x + box.width / 2;
+      const centerY = box.y + box.height / 2;
+      const distance = Math.hypot(centerX - frameCenterX, centerY - frameCenterY);
+      return area - distance * 15;
+    }
+  }
+
+  function scanZxingFrame() {
+    if (!window.ZXing || !video.videoWidth || !video.videoHeight) return;
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const sourceX = Math.floor(vw * 0.06);
+    const sourceY = Math.floor(vh * 0.18);
+    const sourceWidth = Math.floor(vw * 0.88);
+    const sourceHeight = Math.floor(vh * 0.64);
+    const targetWidth = Math.min(1280, sourceWidth);
+    const targetHeight = Math.max(1, Math.round(targetWidth * sourceHeight / sourceWidth));
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    context.filter = 'contrast(1.18) brightness(1.04)';
+    context.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, targetWidth, targetHeight);
+    context.filter = 'none';
+
+    const decoded = decodeCanvasWithZxing(canvas);
+    if (!decoded) {
+      fadeDetectedBox();
+      return;
+    }
+    acceptCandidate(decoded.value, decoded.format);
+  }
+
+  function decodeCanvasWithZxing(targetCanvas) {
+    try {
+      const luminance = new ZXing.HTMLCanvasElementLuminanceSource(targetCanvas);
+      const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+      const hints = new Map();
+      const formats = ZXing.BarcodeFormat;
+      const possible = [
+        formats.QR_CODE, formats.DATA_MATRIX, formats.PDF_417, formats.AZTEC,
+        formats.CODE_128, formats.CODE_39, formats.CODE_93, formats.CODABAR,
+        formats.EAN_13, formats.EAN_8, formats.UPC_A, formats.UPC_E, formats.ITF
+      ].filter(value => value !== undefined);
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, possible);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      const reader = new ZXing.MultiFormatReader();
+      const result = reader.decode(bitmap, hints);
+      if (!result) return null;
+      const numericFormat = result.getBarcodeFormat();
+      const format = Object.keys(formats).find(key => formats[key] === numericFormat) || 'UNKNOWN';
+      return { value: result.getText(), format };
+    } catch { return null; }
+  }
+
+  function acceptCandidate(rawValue, rawFormat) {
+    const value = String(rawValue ?? '').trim();
+    const format = Utils.formatLabel(rawFormat);
+    if (!value) return;
+
+    const now = performance.now();
+    if (candidate.value === value && candidate.format === format && now - candidate.at < 850) {
+      candidate.hits += 1;
+    } else {
+      candidate = { value, format, hits: 1, at: now };
+    }
+    candidate.at = now;
+    setCameraStatus(candidate.hits > 1 ? '已鎖定，正在確認…' : `讀取到 ${format}，確認中…`);
+
+    const isTwoDimensional = ['QR-CODE', 'DATA-MATRIX', 'PDF-417', 'AZTEC'].includes(format);
+    const requiredHits = engine === 'native' && isTwoDimensional ? 1 : 2;
+    if (candidate.hits >= requiredHits) completeResult(value, format);
+  }
+
+  function completeResult(value, format) {
+    scanning = false;
+    const url = Utils.normalizeOpenableUrl(value);
+    const type = Utils.classifyContent(value, format);
+    lastResult = {
+      value, url, format: Utils.formatLabel(format), type,
+      source: 'scan', createdAt: new Date().toISOString()
+    };
+
+    setCameraStatus('掃描完成');
+    pulseDetectedBox();
+    provideFeedback();
+    renderResult(lastResult);
+
+    const saveButton = document.getElementById('saveScanBtn');
+    if (Storage.getSettings().autoSave) {
+      Storage.addHistory(lastResult);
+      saveButton.disabled = true;
+      saveButton.textContent = '已存入歷史';
+      Utils.toast('掃描成功，已加入歷史', 'success');
+    } else {
+      saveButton.disabled = false;
+      saveButton.textContent = '存入歷史';
+      Utils.toast('掃描成功', 'success');
+    }
+  }
+
+  function renderResult(result) {
+    document.getElementById('scanResultType').textContent = result.type;
+    document.getElementById('scanResultFormat').textContent = result.format;
+    document.getElementById('scanResultValue').textContent = result.value;
+    const urlEl = document.getElementById('scanResultUrl');
+    const noUrlEl = document.getElementById('scanNoUrl');
+    const openBtn = document.getElementById('openScanUrlBtn');
+    if (result.url) {
+      urlEl.textContent = result.url;
+      urlEl.href = result.url;
+      urlEl.hidden = false;
+      noUrlEl.hidden = true;
+      openBtn.disabled = false;
+    } else {
+      urlEl.textContent = '';
+      urlEl.removeAttribute('href');
+      urlEl.hidden = true;
+      noUrlEl.hidden = false;
+      openBtn.disabled = true;
+    }
+
+    const meta = document.getElementById('scanResultMeta');
+    meta.replaceChildren(
+      createMetaChip(Utils.sourceLabel(result.source)),
+      createMetaChip(Utils.formatDateTime(result.createdAt)),
+      createMetaChip(engine === 'native' ? '原生辨識' : 'ZXing 辨識')
+    );
+    const card = document.getElementById('scanResultCard');
+    card.hidden = false;
+    setTimeout(() => card.scrollIntoView({ behavior: 'smooth', block: 'start' }), 120);
+  }
+
+  function createMetaChip(text) {
+    const el = document.createElement('span');
+    el.className = 'meta-chip';
+    el.textContent = text;
+    return el;
+  }
+
+  function saveLastResult() {
+    if (!lastResult) return;
+    Storage.addHistory(lastResult);
+    const button = document.getElementById('saveScanBtn');
+    button.disabled = true;
+    button.textContent = '已存入歷史';
+    Utils.toast('已存入歷史', 'success');
+  }
+
+  function continueScan() {
+    if (!running || !stream?.active) {
+      start();
+      return;
+    }
+    document.getElementById('scanResultCard').hidden = true;
+    document.getElementById('detectedBox').hidden = true;
+    resetCandidate();
+    lastResult = null;
+    scanning = true;
+    setCameraStatus('請對準下一個條碼');
+    document.getElementById('cameraCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function resetCandidate() { candidate = { value: '', format: '', hits: 0, at: 0 }; }
+
+  function currentStreamTracksStop() {
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    stream = null;
+    videoTrack = null;
+    if (video) video.srcObject = null;
+  }
+
+  async function stop({ keepResult = false, preserveToken = false } = {}) {
+    if (!preserveToken) lifecycleToken += 1;
+    running = false;
+    scanning = false;
+    processing = false;
+    cancelScheduledLoop();
+    currentStreamTracksStop();
+    torchOn = false;
+    const torchBtn = document.getElementById('torchBtn');
+    if (torchBtn) torchBtn.classList.remove('active');
+    if (video) video.srcObject = null;
+    document.getElementById('zoomPanel')?.setAttribute('hidden', '');
+    document.getElementById('detectedBox')?.setAttribute('hidden', '');
+    if (!keepResult) document.getElementById('scanResultCard')?.setAttribute('hidden', '');
+    releaseWakeLock();
+  }
+
+  function pause() {
+    scanning = false;
+    setCameraStatus('掃描已暫停');
+  }
+
+  function resume() {
+    if (running && stream?.active) {
+      resetCandidate();
+      scanning = true;
+      setCameraStatus('相機已啟動，請對準條碼');
+    } else {
+      start();
+    }
+  }
 
   async function flipCamera() {
-    let devs = [];
-    try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch (_) { }
-    if (devs.length < 2) { UI.toast('此裝置只有一個鏡頭'); return; }
-    const i = devs.findIndex(d => d.deviceId === currentDeviceId);
-    await startCamera(devs[(i + 1) % devs.length].deviceId);
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput');
+      if (devices.length > 1) {
+        const currentIndex = devices.findIndex(device => device.deviceId === currentDeviceId);
+        const next = devices[(currentIndex + 1 + devices.length) % devices.length];
+        await start({ deviceId: next.deviceId });
+      } else {
+        facingMode = facingMode === 'environment' ? 'user' : 'environment';
+        await start({ facingMode });
+      }
+    } catch {
+      Utils.toast('無法切換鏡頭', 'error');
+    }
   }
 
   async function toggleTorch() {
-    if (!currentStream) return;
-    const track = currentStream.getVideoTracks()[0];
-    try { torchOn = !torchOn; await track.applyConstraints({ advanced: [{ torch: torchOn }] }); document.getElementById('btnTorch').classList.toggle('active', torchOn); }
-    catch { UI.toast('此裝置不支援閃光燈'); torchOn = false; }
+    if (!videoTrack?.getCapabilities || !videoTrack.applyConstraints) {
+      Utils.toast('此裝置不支援網頁補光燈', 'error');
+      return;
+    }
+    const capabilities = videoTrack.getCapabilities();
+    if (!capabilities.torch) {
+      Utils.toast('目前鏡頭不支援補光燈', 'error');
+      return;
+    }
+    try {
+      torchOn = !torchOn;
+      await videoTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
+      document.getElementById('torchBtn').classList.toggle('active', torchOn);
+    } catch {
+      torchOn = false;
+      Utils.toast('無法切換補光燈', 'error');
+    }
   }
 
-  return { start: startCamera, pause, resume, stop, flipCamera, toggleTorch };
+  async function refocus() {
+    if (!videoTrack) return;
+    await tuneTrack(videoTrack);
+    const frame = document.getElementById('scanFrame');
+    frame.animate([{ opacity: .55 }, { opacity: 1 }], { duration: 220 });
+    setCameraStatus('重新對焦中…');
+    setTimeout(() => scanning && setCameraStatus('請對準條碼'), 500);
+  }
+
+  function showDetectedBox(box) {
+    if (!box || !video.videoWidth || !video.videoHeight) return;
+    const rect = video.getBoundingClientRect();
+    const videoAspect = video.videoWidth / video.videoHeight;
+    const elementAspect = rect.width / rect.height;
+    let scale;
+    let offsetX = 0;
+    let offsetY = 0;
+    if (videoAspect > elementAspect) {
+      scale = rect.height / video.videoHeight;
+      offsetX = (rect.width - video.videoWidth * scale) / 2;
+    } else {
+      scale = rect.width / video.videoWidth;
+      offsetY = (rect.height - video.videoHeight * scale) / 2;
+    }
+    const el = document.getElementById('detectedBox');
+    el.style.left = `${box.x * scale + offsetX}px`;
+    el.style.top = `${box.y * scale + offsetY}px`;
+    el.style.width = `${Math.max(24, box.width * scale)}px`;
+    el.style.height = `${Math.max(24, box.height * scale)}px`;
+    el.hidden = false;
+    el.dataset.seenAt = String(performance.now());
+  }
+
+  function fadeDetectedBox() {
+    const el = document.getElementById('detectedBox');
+    const seenAt = Number(el.dataset.seenAt || 0);
+    if (!seenAt || performance.now() - seenAt > 260) el.hidden = true;
+  }
+
+  function pulseDetectedBox() {
+    const el = document.getElementById('detectedBox');
+    if (el.hidden) return;
+    el.animate([
+      { transform: 'scale(1)', opacity: 1 },
+      { transform: 'scale(1.04)', opacity: 1 },
+      { transform: 'scale(1)', opacity: .9 }
+    ], { duration: 330 });
+  }
+
+  function provideFeedback() {
+    const settings = Storage.getSettings();
+    if (settings.vibration && navigator.vibrate) navigator.vibrate([45, 35, 90]);
+    if (settings.sound) playBeep();
+  }
+
+  function playBeep() {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      const audioContext = new AudioContextClass();
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(1320, audioContext.currentTime + .09);
+      gain.gain.setValueAtTime(.0001, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(.18, audioContext.currentTime + .015);
+      gain.gain.exponentialRampToValueAtTime(.0001, audioContext.currentTime + .13);
+      oscillator.connect(gain).connect(audioContext.destination);
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + .14);
+      oscillator.addEventListener('ended', () => audioContext.close());
+    } catch { /* autoplay policies may block audio */ }
+  }
+
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+    try { wakeLock = await navigator.wakeLock.request('screen'); }
+    catch { wakeLock = null; }
+  }
+
+  function releaseWakeLock() {
+    if (wakeLock) wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+
+  function handleVisibility() {
+    if (document.visibilityState === 'hidden') {
+      pause();
+      releaseWakeLock();
+    } else if (window.App?.currentPage?.() === 'scan') {
+      requestWakeLock();
+      resume();
+    }
+  }
+
+  function setCameraStatus(text) {
+    const el = document.getElementById('cameraStatus');
+    if (el) el.textContent = text;
+  }
+
+  function setEnginePill(text, className = '') {
+    const el = document.getElementById('scanEnginePill');
+    if (!el) return;
+    el.textContent = text;
+    el.className = `status-pill ${className}`.trim();
+  }
+
+  function showPermissionError(message) {
+    document.getElementById('permissionMessage').textContent = message;
+    document.getElementById('permissionNote').hidden = false;
+    setCameraStatus('相機未啟動');
+  }
+
+  function hidePermissionError() {
+    document.getElementById('permissionNote').hidden = true;
+  }
+
+  function cameraErrorMessage(error) {
+    switch (error?.name) {
+      case 'NotAllowedError': return '相機權限被拒絕。請到瀏覽器網站設定允許相機，再按「重新啟動」。';
+      case 'NotFoundError': return '找不到可用相機，請確認裝置鏡頭正常。';
+      case 'NotReadableError': return '相機可能正被其他 App 使用。請關閉其他相機 App 後重試。';
+      case 'OverconstrainedError': return '目前鏡頭不支援要求的模式，請按「重新啟動」改用預設設定。';
+      case 'SecurityError': return '瀏覽器基於安全性禁止相機。請使用 HTTPS 或 GitHub Pages 網址。';
+      default: return `無法啟動相機${error?.message ? `：${error.message}` : ''}`;
+    }
+  }
+
+  function getEngine() { return engine; }
+  function isRunning() { return running; }
+
+  return { init, start, stop, pause, resume, getEngine, isRunning, decodeCanvasWithZxing };
 })();

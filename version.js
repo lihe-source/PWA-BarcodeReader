@@ -1,1 +1,2 @@
-const APP_VERSION = 'V1_7';
+const APP_VERSION = 'V2_0';
+const APP_BUILD_DATE = '2026-07-11';

@@ -1,96 +1,112 @@
-// history.js — V1_6: added 'import' source support
+const HistoryView = (() => {
+  let initialized = false;
 
-const History = (() => {
-  let allRecords = [];
-  let filterVal = 'all';
-  let searchVal = '';
-
-  const SOURCE_ICON  = { scan:'📷', generate:'✏️', import:'🖼️' };
-  const SOURCE_LABEL = { scan:'掃描',  generate:'生成',  import:'圖片匯入' };
-
-  function relativeTime(ts) {
-    const diff = Date.now() - ts;
-    const m = Math.floor(diff/60000);
-    if (m<1) return '剛剛';
-    if (m<60) return m+'分鐘前';
-    const h=Math.floor(m/60);
-    if (h<24) return h+'小時前';
-    const d=new Date(ts), now=new Date();
-    if (d.toDateString()===new Date(now-86400000).toDateString())
-      return '昨天 '+d.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'});
-    return d.toLocaleDateString('zh-TW',{month:'numeric',day:'numeric'})+' '+
-           d.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'});
-  }
-
-  function filtered() {
-    return allRecords.filter(r => {
-      if (searchVal && !r.content.toLowerCase().includes(searchVal)) return false;
-      if (filterVal==='all') return true;
-      if (filterVal==='1D') return r.category==='1D';
-      if (filterVal==='2D') return r.category==='2D';
-      if (filterVal==='scan') return r.source==='scan';
-      if (filterVal==='generate') return r.source==='generate';
-      if (filterVal==='import') return r.source==='import';
-      return true;
-    });
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    document.getElementById('historySearch').addEventListener('input', render);
+    document.getElementById('historyFilter').addEventListener('change', render);
+    window.addEventListener('barcode-history-changed', render);
+    render();
   }
 
   function render() {
+    const all = Storage.getHistory();
+    const query = document.getElementById('historySearch')?.value.trim().toLowerCase() || '';
+    const filter = document.getElementById('historyFilter')?.value || 'all';
+    const items = all.filter(item => {
+      const sourceMatch = filter === 'all' || item.source === filter;
+      const queryMatch = !query || [item.value, item.url, item.format, item.type]
+        .some(value => String(value || '').toLowerCase().includes(query));
+      return sourceMatch && queryMatch;
+    });
+
     const list = document.getElementById('historyList');
-    const records = filtered();
-    if (!records.length) {
-      list.innerHTML =
-        '<div class="history-empty"><div class="empty-icon">📋</div><p>'+
-        (allRecords.length===0?'還沒有記錄<br>掃描或生成條碼後會顯示在這裡':'沒有符合條件的記錄')+
-        '</p></div>';
+    const empty = document.getElementById('historyEmptyState');
+    const count = document.getElementById('historyCount');
+    if (!list || !empty || !count) return;
+    count.textContent = String(all.length);
+    list.replaceChildren();
+    empty.hidden = items.length > 0;
+
+    if (!items.length) {
+      const title = empty.querySelector('strong');
+      const detail = empty.querySelector('span');
+      if (all.length && (query || filter !== 'all')) {
+        title.textContent = '沒有符合條件的紀錄';
+        detail.textContent = '請調整搜尋文字或來源篩選。';
+      } else {
+        title.textContent = '目前沒有紀錄';
+        detail.textContent = '掃描或產生條碼後，紀錄會顯示在這裡。';
+      }
       return;
     }
-    list.innerHTML = '';
-    records.forEach(r => {
-      const icon = SOURCE_ICON[r.source] || '📄';
-      const item = document.createElement('div');
-      item.className = 'history-item';
-      item.innerHTML =
-        '<div class="history-item-icon">' + icon + '</div>' +
-        '<div class="history-item-body">' +
-          '<div class="history-item-content">' + r.content + '</div>' +
-          '<div class="history-item-meta">' +
-            '<span class="hi-tag '+(r.category==='2D'?'hi-tag-2d':'hi-tag-1d')+'">' + r.format + '</span>' +
-            '<span class="hi-tag hi-tag-src-'+r.source+'">'+(SOURCE_LABEL[r.source]||r.source)+'</span>' +
-            '<span class="hi-time">' + relativeTime(r.timestamp) + '</span>' +
-          '</div>' +
-        '</div>' +
-        '<button class="history-item-del" data-id="'+r.id+'">🗑️</button>';
-      item.querySelector('.history-item-del').addEventListener('click', e => {
-        e.stopPropagation();
-        UI.confirm('確認刪除','確定要刪除這筆記錄嗎？', async () => { await DB.delete(r.id); await load(); });
-      });
-      item.addEventListener('click', () => {
-        UI.showDetail(r,
-          async id => { await DB.delete(id); await load(); },
-          rec => { App.switchTab('generate'); document.getElementById('genInput').value=rec.content; Generator.generate(); }
-        );
-      });
-      list.appendChild(item);
-    });
+
+    const fragment = document.createDocumentFragment();
+    items.forEach(item => fragment.appendChild(createItem(item)));
+    list.appendChild(fragment);
   }
 
-  async function load() { allRecords = await DB.getAll(); render(); }
+  function createItem(item) {
+    const article = document.createElement('article');
+    article.className = 'history-item';
 
-  function init() {
-    document.getElementById('historySearch').addEventListener('input', e => {
-      searchVal = e.target.value.toLowerCase(); render();
+    const head = document.createElement('div');
+    head.className = 'history-item-head';
+    const titleWrap = document.createElement('div');
+    const source = document.createElement('div');
+    source.className = 'history-source';
+    source.textContent = Utils.sourceLabel(item.source);
+    const value = document.createElement('div');
+    value.className = 'history-value selectable';
+    value.textContent = item.value;
+    titleWrap.append(source, value);
+    const format = document.createElement('span');
+    format.className = 'format-tag';
+    format.textContent = item.format;
+    head.append(titleWrap, format);
+    article.appendChild(head);
+
+    if (item.url) {
+      const url = document.createElement('div');
+      url.className = 'history-url selectable';
+      url.textContent = item.url;
+      article.appendChild(url);
+    }
+
+    const sub = document.createElement('div');
+    sub.className = 'history-sub';
+    [item.type, Utils.formatDateTime(item.createdAt)].forEach(text => {
+      const span = document.createElement('span');
+      span.textContent = text;
+      sub.appendChild(span);
     });
-    document.getElementById('historyFilters').addEventListener('click', e => {
-      const chip = e.target.closest('.filter-chip'); if(!chip) return;
-      filterVal = chip.dataset.filter;
-      document.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c===chip));
-      render();
-    });
-    document.getElementById('historyClearBtn').addEventListener('click', () => {
-      UI.confirm('清除全部','確定要刪除所有記錄嗎？此操作無法復原。', async () => { await DB.clearAll(); await load(); });
-    });
+    article.appendChild(sub);
+
+    const actions = document.createElement('div');
+    actions.className = 'history-actions';
+    actions.appendChild(actionButton('複製', () => Utils.copyText(item.value)));
+    if (item.url) actions.appendChild(actionButton('開啟網址', () => Utils.openUrl(item.url)));
+    actions.appendChild(actionButton('再次產生', () => {
+      window.App?.navigate('generate');
+      setTimeout(() => Generator.focusValue(item.value), 80);
+    }));
+    actions.appendChild(actionButton('刪除', () => {
+      Storage.removeHistory(item.id);
+      Utils.toast('紀錄已刪除');
+    }, 'delete'));
+    article.appendChild(actions);
+    return article;
   }
 
-  return { init, load };
+  function actionButton(label, handler, className = '') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `mini-btn ${className}`.trim();
+    button.textContent = label;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  return { init, render };
 })();
