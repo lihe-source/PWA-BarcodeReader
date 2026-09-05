@@ -1,159 +1,58 @@
+'use strict';
 const Utils = (() => {
-  const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"']+/i;
-
-  function toast(message, type = '') {
-    const stack = document.getElementById('toastStack');
-    if (!stack) return;
-    const el = document.createElement('div');
-    el.className = `toast ${type}`.trim();
-    el.textContent = String(message);
-    stack.appendChild(el);
-    setTimeout(() => {
-      el.style.opacity = '0';
-      el.style.transform = 'translateY(8px)';
-      setTimeout(() => el.remove(), 180);
-    }, 2400);
+  const $ = id => document.getElementById(id);
+  const errors = [];
+  function report(error, scope = '系統') {
+    console.warn(scope, error);
+    // Never retain scanned contents, file contents or raw server responses in diagnostics.
+    errors.unshift({ at: new Date().toISOString(), scope, name: error?.name || 'Error' });
+    errors.splice(12);
   }
-
+  function toast(message, type = '', action) {
+    const el = document.createElement('div'); el.className = `toast ${type}`;
+    const text = document.createElement('span'); text.textContent = message; el.append(text);
+    if (action) { const b = document.createElement('button'); b.textContent = action.label; b.onclick = () => { action.run(); el.remove(); }; el.append(b); }
+    $('toastStack')?.append(el); setTimeout(() => el.remove(), action ? 9000 : 4000);
+  }
   function normalizeOpenableUrl(raw) {
-    const value = String(raw ?? '').trim();
-    if (!value) return '';
-
-    if (/^(https?:\/\/)/i.test(value)) {
-      try {
-        const url = new URL(value);
-        return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
-      } catch { return ''; }
-    }
-
-    if (/^www\./i.test(value)) {
-      try { return new URL(`https://${value}`).href; } catch { return ''; }
-    }
-
-    const match = value.match(URL_PATTERN);
-    if (match) {
-      const candidate = /^www\./i.test(match[0]) ? `https://${match[0]}` : match[0];
-      try {
-        const url = new URL(candidate);
-        return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
-      } catch { return ''; }
-    }
-    return '';
+    const text = String(raw ?? '').trim();
+    // Only treat a complete URL as a link. No links extracted from arbitrary payloads.
+    if (!/^(https?:\/\/|www\.)\S+$/i.test(text)) return '';
+    try { const u = new URL(/^www\./i.test(text) ? `https://${text}` : text); return /^(http:|https:)$/.test(u.protocol) ? u.href : ''; } catch { return ''; }
   }
-
   function classifyContent(value, format = '') {
-    const text = String(value ?? '').trim();
-    if (normalizeOpenableUrl(text)) return '網址';
-    if (/^mailto:/i.test(text) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return '電子郵件';
-    if (/^tel:/i.test(text)) return '電話號碼';
-    if (/^WIFI:/i.test(text)) return 'Wi-Fi 設定';
-    if (/^(geo:|BEGIN:VCARD|BEGIN:VEVENT)/i.test(text)) return '結構化資料';
-    if (/^(EAN|UPC|CODE|ITF|CODABAR)/i.test(String(format)) || /^\d{8,14}$/.test(text)) return '產品／識別碼';
-    return '文字內容';
+    const t = String(value ?? '');
+    if (/^WIFI:/i.test(t)) return 'Wi-Fi 設定';
+    if (/^(BEGIN:VCARD|BEGIN:VEVENT|geo:)/i.test(t)) return '結構化資料';
+    if (/^mailto:/i.test(t)) return '電子郵件';
+    if (/^tel:/i.test(t)) return '電話號碼';
+    if (normalizeOpenableUrl(t)) return '網址';
+    return /^(EAN|UPC|CODE|ITF|CODABAR)/i.test(format) ? '產品／識別碼' : '文字內容';
   }
-
+  function formatLabel(f = '') { return String(f || 'UNKNOWN').replaceAll('_', '-').toUpperCase(); }
+  function sourceLabel(s) { return ({scan:'即時掃描',import:'圖片解碼',generate:'產生條碼'})[s] || '其他'; }
+  function formatDateTime(t) { const d = new Date(t); return Number.isNaN(d.getTime()) ? '' : d.toLocaleString('zh-TW',{hour12:false}); }
+  function uniqueId() { return globalThis.crypto?.randomUUID?.() || `id-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+  function safeJsonParse(v,f) { try { return JSON.parse(v) ?? f; } catch { return f; } }
+  function debounce(fn,ms=200) { let t; return (...args) => { clearTimeout(t); t=setTimeout(()=>fn(...args),ms); }; }
   async function copyText(text) {
-    const value = String(text ?? '');
-    try {
-      await navigator.clipboard.writeText(value);
-      toast('已複製讀值', 'success');
-      return true;
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = value;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      let ok = false;
-      try { ok = document.execCommand('copy'); } catch { ok = false; }
-      ta.remove();
-      toast(ok ? '已複製讀值' : '無法複製，請長按文字複製', ok ? 'success' : 'error');
-      return ok;
-    }
+    try { await navigator.clipboard.writeText(String(text)); toast('已複製原始內容','success'); return true; }
+    catch { const el=document.createElement('textarea'); el.value=String(text); document.body.append(el); el.select(); let ok=false; try{ok=document.execCommand('copy');}catch{} el.remove(); toast(ok?'已複製原始內容':'請長按讀值手動複製',ok?'success':'error'); return ok; }
   }
-
-  async function shareText(title, text, url = '') {
-    const payload = { title, text };
-    if (url) payload.url = url;
-    if (navigator.share) {
-      try { await navigator.share(payload); return true; }
-      catch (error) {
-        if (error?.name === 'AbortError') return false;
-      }
-    }
-    await copyText(url || text);
-    return false;
+  async function shareText(title,text) { try { if(navigator.share){await navigator.share({title,text});return;} } catch(e){if(e.name==='AbortError')return;} await copyText(text); }
+  function openUrl(value) {
+    const url=normalizeOpenableUrl(value); if(!url)return;
+    const host=new URL(url).hostname;
+    if(window.confirm(`即將開啟外部網站：\n${host}\n\n${url}\n\n請確認網址可信，勿輸入不明網站要求的帳密。`))window.open(url,'_blank','noopener,noreferrer');
   }
-
-  function openUrl(url) {
-    const normalized = normalizeOpenableUrl(url);
-    if (!normalized) {
-      toast('內容不是可開啟的 HTTP／HTTPS 網址', 'error');
-      return false;
-    }
-    window.open(normalized, '_blank', 'noopener,noreferrer');
-    return true;
-  }
-
-  function formatDateTime(value) {
-    const date = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(date.getTime())) return '';
-    return new Intl.DateTimeFormat('zh-TW', {
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-    }).format(date);
-  }
-
-  function formatLabel(format = '') {
-    return String(format || 'UNKNOWN').replaceAll('_', '-').toUpperCase();
-  }
-
-  function sourceLabel(source) {
-    return ({ scan: '即時掃描', import: '圖片解碼', generate: '產生條碼' })[source] || '未知來源';
-  }
-
-  function debounce(fn, delay = 250) {
-    let timer = 0;
-    return (...args) => {
-      clearTimeout(timer);
-      timer = setTimeout(() => fn(...args), delay);
-    };
-  }
-
-  function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  function canvasToBlob(canvas, type = 'image/png', quality) {
-    return new Promise((resolve, reject) => {
-      canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('無法建立圖片')), type, quality);
-    });
-  }
-
-  function uniqueId(prefix = 'item') {
-    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  }
-
-  function safeJsonParse(value, fallback) {
-    try { return JSON.parse(value); } catch { return fallback; }
-  }
-
+  function downloadBlob(blob,name) { const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),30000); }
+  function canvasToBlob(c) { return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error('圖片轉換失敗')),'image/png')); }
   function escapeCsv(value) {
-    const text = String(value ?? '');
-    return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+    let t=String(value??'');
+    // CSV has no column types: apostrophe protects formulas AND long numeric IDs in Excel.
+    if (/^[\s]*[=+@-]/.test(t) || /^[\s]*\d/.test(t) || /^[\t\r\n]/.test(t)) t="'"+t;
+    return '"'+t.replaceAll('"','""')+'"';
   }
-
-  return {
-    toast, normalizeOpenableUrl, classifyContent, copyText, shareText, openUrl,
-    formatDateTime, formatLabel, sourceLabel, debounce, downloadBlob, canvasToBlob,
-    uniqueId, safeJsonParse, escapeCsv
-  };
+  function busyError(e,label='操作失敗') { report(e,label); toast(`${label}：${e?.message || '請重試'}`,'error'); }
+  return {$,report,errors,toast,normalizeOpenableUrl,classifyContent,formatLabel,sourceLabel,formatDateTime,uniqueId,safeJsonParse,debounce,copyText,shareText,openUrl,downloadBlob,canvasToBlob,escapeCsv,busyError};
 })();

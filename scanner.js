@@ -1,713 +1,147 @@
-const Scanner = (() => {
-  const NATIVE_FORMATS = [
-    'aztec', 'codabar', 'code_39', 'code_93', 'code_128',
-    'data_matrix', 'ean_8', 'ean_13', 'itf', 'pdf417',
-    'qr_code', 'upc_a', 'upc_e'
-  ];
-
-  const NATIVE_FORMAT_LABELS = {
-    aztec: 'AZTEC', codabar: 'CODABAR', code_39: 'CODE_39', code_93: 'CODE_93',
-    code_128: 'CODE_128', data_matrix: 'DATA_MATRIX', ean_8: 'EAN_8',
-    ean_13: 'EAN_13', itf: 'ITF', pdf417: 'PDF_417', qr_code: 'QR_CODE',
-    upc_a: 'UPC_A', upc_e: 'UPC_E'
-  };
-
-  let video;
-  let canvas;
-  let context;
-  let stream = null;
-  let videoTrack = null;
-  let detector = null;
-  let engine = 'none';
-  let running = false;
-  let scanning = false;
-  let processing = false;
-  let scheduledId = 0;
-  let usingVideoFrameCallback = false;
-  let currentDeviceId = '';
-  let facingMode = 'environment';
-  let torchOn = false;
-  let wakeLock = null;
-  let lastScanAt = 0;
-  let candidate = { value: '', format: '', hits: 0, at: 0 };
-  let lastResult = null;
-  let initialized = false;
-  let lifecycleToken = 0;
-
-  function init() {
-    if (initialized) return;
-    initialized = true;
-    video = document.getElementById('scanVideo');
-    canvas = document.getElementById('scanCanvas');
-    context = canvas.getContext('2d', { willReadFrequently: true });
-
-    document.getElementById('cameraStartOverlay').addEventListener('click', () => start());
-    document.getElementById('retryCameraBtn').addEventListener('click', () => start());
-    document.getElementById('flipCameraBtn').addEventListener('click', flipCamera);
-    document.getElementById('torchBtn').addEventListener('click', toggleTorch);
-    document.getElementById('zoomRange').addEventListener('input', onZoomInput);
-    document.getElementById('continueScanBtn').addEventListener('click', continueScan);
-    document.getElementById('copyScanBtn').addEventListener('click', () => lastResult && Utils.copyText(lastResult.value));
-    document.getElementById('shareScanBtn').addEventListener('click', () => {
-      if (!lastResult) return;
-      Utils.shareText('條碼讀值', lastResult.value, lastResult.url);
+'use strict';
+const Scanner=(()=>{
+  const nativeNames=['aztec','codabar','code_39','code_93','code_128','data_matrix','ean_8','ean_13','itf','pdf417','qr_code','upc_a','upc_e'];
+  const $=id=>document.getElementById(id);
+  let video,canvas,ctx,stream=null,track=null,detector=null,nativeSupported=[];
+  let token=0,running=false,scanning=false,starting=false,frameTimer=0,idleTimer=0,lastAttempt=0,failures=0,processing=false,wake=null;
+  let result=null,candidate={value:null,hits:0,at:0},engine='未啟動',audio=null,torch=false,deviceId='',sessionCount=0,rejectedAt=0;
+  const seen=new Map();
+  function status(t){$('cameraStatus').textContent=t;}
+  function init(){
+    video=$('scanVideo');canvas=$('scanCanvas');ctx=canvas.getContext('2d',{willReadFrequently:true});
+    $('cameraStartOverlay').onclick=()=>start();$('retryCameraBtn').onclick=()=>start();
+    $('flipCameraBtn').onclick=()=>flip();$('cameraSelect').onchange=e=>start(e.target.value);
+    $('torchBtn').onclick=()=>toggleTorch();$('zoomRange').oninput=Utils.debounce(e=>zoom(Number(e.target.value)),100);
+    $('continueScanBtn').onclick=()=>continueScan();$('pauseCameraBtn').onclick=()=>{stop();status('已停止相機');$('cameraStartOverlay').hidden=false;};
+    $('copyScanBtn').onclick=()=>result&&Utils.copyText(result.value);
+    $('shareScanBtn').onclick=()=>result&&Utils.shareText('條碼讀值',result.value);
+    $('saveScanBtn').onclick=()=>save();$('openScanUrlBtn').onclick=()=>result&&Utils.openUrl(result.url);
+    $('scanResultUrl').onclick=e=>{e.preventDefault();if(result)Utils.openUrl(result.url);};
+    $('continuousToggle').onchange=e=>Storage.saveSettings({continuous:e.target.checked}).catch(e=>Utils.busyError(e,'設定未儲存'));
+    document.addEventListener('pointerdown',unlockAudio,{once:true});document.addEventListener('keydown',unlockAudio,{once:true});
+    document.addEventListener('visibilitychange',()=>{
+      if(document.hidden){stop();}
+      else if(App.currentPage()==='scan'&&!result)start();
+      else if(App.currentPage()==='scan'){status('結果已保留，按繼續掃描啟動相機');$('cameraStartOverlay').hidden=false;}
     });
-    document.getElementById('openScanUrlBtn').addEventListener('click', () => lastResult && Utils.openUrl(lastResult.url));
-    document.getElementById('saveScanBtn').addEventListener('click', saveLastResult);
-
-    video.addEventListener('loadedmetadata', () => setCameraStatus('相機已啟動，請對準條碼'));
-    video.addEventListener('click', refocus);
-    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide',()=>stop());
+    video.onclick=async()=>{if(track){await tune(track);status('已要求連續對焦；請調整距離');}};
+    window.addEventListener('barcode-settings-changed',()=>{if(running){failures=0;candidate={value:null,hits:0,at:0};}});
   }
-
-  async function initEngine() {
-    detector = null;
-    engine = 'none';
-    setEnginePill('載入辨識引擎…');
-
-    if ('BarcodeDetector' in window) {
-      try {
-        const supported = typeof BarcodeDetector.getSupportedFormats === 'function'
-          ? await BarcodeDetector.getSupportedFormats()
-          : NATIVE_FORMATS;
-        const formats = NATIVE_FORMATS.filter(format => supported.includes(format));
-        if (formats.length) {
-          detector = new BarcodeDetector({ formats });
-          engine = 'native';
-          setEnginePill('原生高速辨識', 'ready');
-          return;
-        }
-      } catch (error) {
-        console.warn('BarcodeDetector initialization failed:', error);
+  async function makeDetector(){
+    nativeSupported=[];if(!window.BarcodeDetector)return null;
+    try{nativeSupported=typeof BarcodeDetector.getSupportedFormats==='function'?await BarcodeDetector.getSupportedFormats():nativeNames;const names=nativeNames.filter(f=>nativeSupported.includes(f));return names.length?new BarcodeDetector({formats:names}):null;}catch{return null;}
+  }
+  async function start(requested=''){
+    const mine=++token;stopResources();starting=true;status('正在啟動相機…');$('permissionNote').hidden=true;$('cameraStartOverlay').hidden=true;
+    let owned=null;
+    try{
+      if(!navigator.mediaDevices?.getUserMedia)throw new Error('請使用 HTTPS 網址及支援相機的 Safari／Chrome。');
+      const constraints={audio:false,video:{...(requested?{deviceId:{exact:requested}}:{facingMode:{ideal:'environment'}}),width:{ideal:1280},height:{ideal:720},frameRate:{ideal:24,max:30}}};
+      try{owned=await navigator.mediaDevices.getUserMedia(constraints);}catch(e){if(e.name!=='OverconstrainedError')throw e;owned=await navigator.mediaDevices.getUserMedia({audio:false,video:requested?{deviceId:{exact:requested}}:{facingMode:'environment'}});}
+      if(mine!==token){owned.getTracks().forEach(t=>t.stop());return;}
+      stream=owned;track=owned.getVideoTracks()[0];deviceId=track.getSettings?.().deviceId||requested;video.srcObject=owned;await video.play();
+      if(mine!==token){owned.getTracks().forEach(t=>t.stop());return;}
+      await tune(track);const newDetector=await makeDetector();
+      if(mine!==token){owned.getTracks().forEach(t=>t.stop());return;}
+      detector=newDetector;running=true;scanning=true;starting=false;failures=0;candidate={value:null,hits:0,at:0};
+      result=null;App.saveSessionResult(null);$('scanResultCard').hidden=true;$('page-scan').classList.remove('has-result');
+      setupCapabilities();await listCameras(mine);if(mine!==token)return;requestWake(mine);schedule(mine);status('請將條碼放入框內');
+      track.addEventListener('ended',()=>{if(mine===token){stop();status('相機已中斷，請重新啟動');$('cameraStartOverlay').hidden=false;}});
+    }catch(e){owned?.getTracks().forEach(t=>t.stop());if(mine!==token)return;starting=false;stopResources();const messages={NotAllowedError:'相機權限未允許，請到瀏覽器網站設定允許相機。',NotFoundError:'找不到可用相機，可改用圖片解碼。',NotReadableError:'相機可能正被其他程式使用，請關閉後重試。'};$('permissionMessage').textContent=messages[e.name]||e.message;$('permissionNote').hidden=false;$('cameraStartOverlay').hidden=false;status('相機尚未啟動');Utils.report(e,'相機啟動');}
+  }
+  function stopResources(){
+    clearTimeout(frameTimer);clearTimeout(idleTimer);running=false;scanning=false;starting=false;processing=false;Decoder.cancel();
+    stream?.getTracks().forEach(t=>t.stop());stream=null;track=null;if(video)video.srcObject=null;releaseWake();torch=false;
+    $('torchBtn')?.classList.remove('active');$('zoomPanel')?.setAttribute('hidden','');
+  }
+  function stop(){++token;stopResources();}
+  function schedule(mine){clearTimeout(frameTimer);if(running&&scanning&&mine===token)frameTimer=setTimeout(()=>scanFrame(mine),engine.startsWith('原生')?100:180);}
+  function crop(){
+    const vr=video.getBoundingClientRect(),fr=$('scanFrame').getBoundingClientRect();
+    const scale=Math.max(vr.width/video.videoWidth,vr.height/video.videoHeight);
+    const ox=(video.videoWidth*scale-vr.width)/2,oy=(video.videoHeight*scale-vr.height)/2;
+    const x=Math.max(0,(fr.left-vr.left+ox)/scale),y=Math.max(0,(fr.top-vr.top+oy)/scale);
+    const w=Math.min(video.videoWidth-x,fr.width/scale),h=Math.min(video.videoHeight-y,fr.height/scale);
+    const width=Math.max(1,Math.min(1280,Math.round(w))),height=Math.max(1,Math.round(width*h/w));
+    if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}
+    ctx.drawImage(video,x,y,w,h,0,0,width,height);return canvas;
+  }
+  async function scanFrame(mine){
+    if(mine!==token||!running||!scanning)return;
+    const began=performance.now();processing=true;
+    try{
+      if(video.readyState<2||!video.videoWidth)return;
+      const frame=crop(),wanted=Storage.getSettings().format;let decoded=null;
+      if(detector&&failures%4!==3){
+        engine='原生辨識';const codes=await detector.detect(frame);
+        if(mine!==token)return;
+        const mapped=codes.map(c=>({value:c.rawValue,format:Utils.formatLabel(c.format==='pdf417'?'PDF_417':c.format),box:c.boundingBox}));
+        const eligible=mapped.filter(c=>wanted==='all'||c.format===wanted);
+        eligible.sort((a,b)=>{const d=c=>c.box?Math.hypot(c.box.x+c.box.width/2-frame.width/2,c.box.y+c.box.height/2-frame.height/2):Infinity;return d(a)-d(b);});decoded=eligible[0]||null;
       }
-    }
-
-    if (!window.ZXing?.MultiFormatReader) await waitForGlobal('ZXing', 8000);
-    if (window.ZXing?.MultiFormatReader) {
-      engine = 'zxing';
-      setEnginePill('ZXing 備援', 'fallback');
-      return;
-    }
-
-    setEnginePill('無可用引擎', 'fallback');
-  }
-
-
-  function waitForGlobal(name, timeoutMs) {
-    if (window[name]) return Promise.resolve(true);
-    return new Promise(resolve => {
-      const startedAt = Date.now();
-      const timer = setInterval(() => {
-        if (window[name]) {
-          clearInterval(timer);
-          resolve(true);
-        } else if (Date.now() - startedAt >= timeoutMs) {
-          clearInterval(timer);
-          resolve(false);
-        }
-      }, 80);
-    });
-  }
-
-  async function start(options = {}) {
-    init();
-    const token = ++lifecycleToken;
-    await stop({ keepResult: true, preserveToken: true });
-    hidePermissionError();
-    setCameraStatus('正在啟動相機…');
-    document.getElementById('cameraStartOverlay').hidden = true;
-    document.getElementById('scanResultCard').hidden = true;
-    document.getElementById('detectedBox').hidden = true;
-    resetCandidate();
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      showPermissionError('此瀏覽器不支援即時相機。請改用 Safari／Chrome，並從 HTTPS 或 GitHub Pages 開啟。');
-      return false;
-    }
-
-    const enginePromise = initEngine();
-
-    const requestedDeviceId = options.deviceId || '';
-    const requestedFacingMode = options.facingMode || facingMode || 'environment';
-    const primaryConstraints = {
-      audio: false,
-      video: requestedDeviceId ? {
-        deviceId: { exact: requestedDeviceId },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30, max: 60 }
-      } : {
-        facingMode: { ideal: requestedFacingMode },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30, max: 60 }
+      if(!decoded&&(!detector||failures%4===3)){
+        engine=`ZXing・${Decoder.mode()}`;decoded=await Decoder.decode(frame,{hard:failures>8,format:wanted});
       }
-    };
-
-    try {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(primaryConstraints);
-      } catch (firstError) {
-        console.warn('High resolution camera constraint failed:', firstError);
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: requestedDeviceId
-            ? { deviceId: { exact: requestedDeviceId } }
-            : { facingMode: { ideal: requestedFacingMode } }
-        });
-      }
-
-      videoTrack = stream.getVideoTracks()[0] || null;
-      const settings = videoTrack?.getSettings?.() || {};
-      currentDeviceId = settings.deviceId || requestedDeviceId;
-      facingMode = settings.facingMode || requestedFacingMode;
-      video.srcObject = stream;
-      video.setAttribute('playsinline', 'true');
-      video.muted = true;
-      await video.play();
-      await tuneTrack(videoTrack);
-      configureZoom(videoTrack);
-      await enginePromise;
-      if (token !== lifecycleToken) {
-        currentStreamTracksStop();
-        return false;
-      }
-      if (engine === 'none') {
-        throw new Error('條碼解碼元件未載入，請確認網路連線後重新整理。');
-      }
-      running = true;
-      scanning = true;
-      lastScanAt = 0;
-      await requestWakeLock();
-      scheduleLoop();
-      setCameraStatus('相機已啟動，請對準條碼');
-      return true;
-    } catch (error) {
-      console.error('Camera start error:', error);
-      if (token === lifecycleToken) {
-        currentStreamTracksStop();
-        const message = cameraErrorMessage(error);
-        showPermissionError(message);
-        document.getElementById('cameraStartOverlay').hidden = false;
-      }
-      return false;
-    }
+      if(mine!==token||!scanning)return;
+      $('scanEnginePill').textContent=engine;
+      if(decoded&&decoded.value.length){failures=0;await accept(decoded,mine);}else failures++;
+    }catch(e){if(e.name!=='AbortError')failures++;}
+    finally{if(mine===token){processing=false;lastAttempt=Math.round(performance.now()-began);schedule(mine);}}
   }
-
-  async function tuneTrack(track) {
-    if (!track?.getCapabilities || !track.applyConstraints) return;
-    const capabilities = track.getCapabilities();
-    const advanced = [];
-    if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
-      advanced.push({ focusMode: 'continuous' });
-    }
-    if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes('continuous')) {
-      advanced.push({ exposureMode: 'continuous' });
-    }
-    if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes('continuous')) {
-      advanced.push({ whiteBalanceMode: 'continuous' });
-    }
-    if (advanced.length) {
-      try { await track.applyConstraints({ advanced }); }
-      catch (error) { console.debug('Camera tuning not fully supported:', error); }
-    }
+  async function accept(decoded,mine){
+    const value=String(decoded.value),format=Utils.formatLabel(decoded.format),now=Date.now();
+    const reason=Storage.validate(value,format);
+    if(reason){status(reason);if(now-rejectedAt>1800){beep(false);rejectedAt=now;}return;}
+    if(candidate.value===value&&candidate.format===format&&now-candidate.at<1800)candidate.hits++;else candidate={value,format,hits:1,at:now};candidate.at=now;
+    if(candidate.hits<2){status('已讀取，正在交叉確認…');return;}
+    const s=Storage.getSettings(),key=JSON.stringify([value,format]);
+    if(s.continuous&&now-(seen.get(key)||0)<s.cooldown*1000){status('重複條碼冷卻中，請換下一個');return;}
+    seen.set(key,now);for(const [k,at]of seen)if(now-at>60000)seen.delete(k);
+    candidate={value:null,hits:0,at:0};scanning=false;
+    result=Storage.normalize({value,format,source:'scan'});sessionCount++;$('sessionCount').textContent=`本次 ${sessionCount} 筆`;
+    renderResult();App.saveSessionResult(result);beep(true);
+    if(s.vibration&&navigator.vibrate)navigator.vibrate(60);
+    let saved=false;
+    if(s.autoSave){try{await save(false);saved=true;}catch{}}
+    if(mine!==token)return;
+    status(saved?'已保存，請換下一個條碼':'結果已保留');
+    if(s.continuous&&(!s.autoSave||saved)){scanning=true;}
+    else{releaseWake();idleTimer=setTimeout(()=>{if(mine===token&&!scanning){stop();status('相機已休眠，結果已保留');$('cameraStartOverlay').hidden=false;}},15000);}
   }
-
-  function configureZoom(track) {
-    const panel = document.getElementById('zoomPanel');
-    const range = document.getElementById('zoomRange');
-    const output = document.getElementById('zoomValue');
-    panel.hidden = true;
-    if (!track?.getCapabilities) return;
-    const zoom = track.getCapabilities().zoom;
-    if (!zoom || typeof zoom.min !== 'number' || typeof zoom.max !== 'number' || zoom.max <= zoom.min) return;
-    const current = track.getSettings?.().zoom || zoom.min;
-    range.min = zoom.min;
-    range.max = zoom.max;
-    range.step = zoom.step || 0.1;
-    range.value = current;
-    output.value = `${Number(current).toFixed(1)}×`;
-    panel.hidden = false;
+  function renderResult(){
+    if(!result)return;$('scanResultCard').hidden=false;$('page-scan').classList.add('has-result');
+    $('scanResultType').textContent=result.type;$('scanResultFormat').textContent=result.format;$('scanResultValue').textContent=result.value;
+    $('scanResultMeta').textContent=`${result.value.length} 字元 · ${Utils.formatDateTime(result.createdAt)}`;
+    const link=$('scanResultUrl');link.textContent=result.url;link.href=result.url||'#';link.hidden=!result.url;$('scanNoUrl').hidden=Boolean(result.url);$('openScanUrlBtn').disabled=!result.url;
+    $('saveScanBtn').disabled=false;$('saveScanBtn').textContent='存入歷史';
   }
-
-  async function onZoomInput(event) {
-    const value = Number(event.target.value);
-    document.getElementById('zoomValue').value = `${value.toFixed(1)}×`;
-    if (!videoTrack?.applyConstraints) return;
-    try { await videoTrack.applyConstraints({ advanced: [{ zoom: value }] }); }
-    catch { /* ignore devices that expose but reject zoom */ }
+  async function save(showToast=true){
+    if(!result)return;const entry=result;
+    try{await Storage.addHistory(entry);if(result?.id===entry.id){$('saveScanBtn').disabled=true;$('saveScanBtn').textContent='已存入歷史';}if(showToast)Utils.toast('已存入歷史','success');}
+    catch(e){Utils.busyError(e,'未能保存，請先複製或匯出結果');if(!showToast)throw e;}
   }
-
-  function scheduleLoop() {
-    cancelScheduledLoop();
-    if (!running) return;
-    if (typeof video.requestVideoFrameCallback === 'function') {
-      usingVideoFrameCallback = true;
-      scheduledId = video.requestVideoFrameCallback(scanFrame);
-    } else {
-      usingVideoFrameCallback = false;
-      scheduledId = requestAnimationFrame(scanFrame);
-    }
+  function continueScan(){
+    if(!running){start(deviceId);return;}clearTimeout(idleTimer);result=null;App.saveSessionResult(null);$('scanResultCard').hidden=true;$('page-scan').classList.remove('has-result');candidate={value:null,hits:0,at:0};scanning=true;requestWake(token);status('請對準下一個條碼');schedule(token);
   }
-
-  function cancelScheduledLoop() {
-    if (!scheduledId) return;
-    if (usingVideoFrameCallback && typeof video?.cancelVideoFrameCallback === 'function') {
-      video.cancelVideoFrameCallback(scheduledId);
-    } else {
-      cancelAnimationFrame(scheduledId);
-    }
-    scheduledId = 0;
+  async function tune(t){try{const c=t?.getCapabilities?.()||{};const advanced=[];for(const k of ['focusMode','exposureMode','whiteBalanceMode'])if(c[k]?.includes('continuous'))advanced.push({[k]:'continuous'});if(advanced.length)await t.applyConstraints({advanced});}catch{}}
+  function setupCapabilities(){
+    let c={};try{c=track?.getCapabilities?.()||{};}catch{}
+    $('torchBtn').disabled=!c.torch;$('torchBtn').title=c.torch?'補光燈':'目前鏡頭不支援補光燈';
+    if(c.zoom&&c.zoom.max>c.zoom.min){const r=$('zoomRange');r.min=c.zoom.min;r.max=c.zoom.max;r.step=c.zoom.step||0.1;r.value=track.getSettings().zoom||c.zoom.min;$('zoomValue').value=`${Number(r.value).toFixed(1)}×`;$('zoomPanel').hidden=false;}
   }
-
-  async function scanFrame() {
-    scheduledId = 0;
-    if (!running) return;
-
-    const now = performance.now();
-    const interval = engine === 'native' ? 65 : 105;
-    if (scanning && !processing && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && now - lastScanAt >= interval) {
-      processing = true;
-      lastScanAt = now;
-      try {
-        if (engine === 'native') await scanNativeFrame();
-        else scanZxingFrame();
-      } catch (error) {
-        console.debug('Frame decode failed:', error);
-      } finally {
-        processing = false;
-      }
-    }
-    if (running) scheduleLoop();
+  async function zoom(value){const t=track;try{await t?.applyConstraints({advanced:[{zoom:value}]});if(t===track)$('zoomValue').value=`${value.toFixed(1)}×`;}catch{Utils.toast('鏡頭無法套用此縮放值');}}
+  async function toggleTorch(){const t=track;if(!t)return;try{const next=!torch;await t.applyConstraints({advanced:[{torch:next}]});if(t===track){torch=next;$('torchBtn').classList.toggle('active',next);}}catch{Utils.toast('無法切換補光燈','error');}}
+  async function listCameras(mine){try{const devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');if(mine!==token)return;const select=$('cameraSelect');select.replaceChildren();devices.forEach((d,i)=>{const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||`鏡頭 ${i+1}`;select.append(o);});select.value=deviceId;select.hidden=devices.length<2;}catch{}}
+  function flip(){const options=[...$('cameraSelect').options];if(options.length<2)return;const at=options.findIndex(o=>o.value===deviceId);start(options[(at+1)%options.length].value);}
+  async function requestWake(mine){releaseWake();try{if(navigator.wakeLock&&!document.hidden){const w=await navigator.wakeLock.request('screen');if(mine===token&&scanning)wake=w;else w.release();}}catch{}}
+  function releaseWake(){wake?.release().catch(()=>{});wake=null;}
+  async function unlockAudio(){try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;if(!audio||audio.state==='closed')audio=new C();if(audio.state==='suspended')await audio.resume();}catch{}}
+  async function beep(success=true,force=false){
+    if(!force&&!Storage.getSettings().sound)return;await unlockAudio();if(!audio||audio.state!=='running'){if(force)Utils.toast('無法播放，請確認音量與瀏覽器音訊權限');return;}
+    const o=audio.createOscillator(),g=audio.createGain(),at=audio.currentTime;o.frequency.value=success?1040:260;g.gain.setValueAtTime(0.13,at);g.gain.exponentialRampToValueAtTime(.001,at+.16);o.connect(g).connect(audio.destination);o.start();o.stop(at+.17);o.onended=()=>{o.disconnect();g.disconnect();};
   }
-
-  async function scanNativeFrame() {
-    let codes = [];
-    try { codes = await detector.detect(video); } catch { codes = []; }
-    if (!codes?.length) {
-      // Every few frames, retry with a centered crop and contrast enhancement.
-      if (Math.floor(performance.now() / 400) % 2 === 0) codes = await detectNativeCrop();
-    }
-    if (!codes?.length) {
-      fadeDetectedBox();
-      return;
-    }
-
-    const best = pickBestNativeResult(codes);
-    if (!best?.rawValue) return;
-    showDetectedBox(best._fullBoundingBox || best.boundingBox);
-    acceptCandidate(best.rawValue, NATIVE_FORMAT_LABELS[best.format] || best.format || 'UNKNOWN');
-  }
-
-  async function detectNativeCrop() {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (!vw || !vh) return [];
-    const cropWidth = Math.floor(vw * 0.88);
-    const cropHeight = Math.floor(vh * 0.58);
-    const sourceX = Math.floor((vw - cropWidth) / 2);
-    const sourceY = Math.floor((vh - cropHeight) / 2);
-    canvas.width = Math.min(cropWidth, 1280);
-    canvas.height = Math.round(canvas.width * cropHeight / cropWidth);
-    context.filter = 'contrast(1.25) brightness(1.05)';
-    context.drawImage(video, sourceX, sourceY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
-    context.filter = 'none';
-    try {
-      const codes = await detector.detect(canvas);
-      return codes.map(code => {
-        if (!code.boundingBox) return code;
-        const scaleX = cropWidth / canvas.width;
-        const scaleY = cropHeight / canvas.height;
-        code._fullBoundingBox = {
-          x: sourceX + code.boundingBox.x * scaleX,
-          y: sourceY + code.boundingBox.y * scaleY,
-          width: code.boundingBox.width * scaleX,
-          height: code.boundingBox.height * scaleY
-        };
-        return code;
-      });
-    } catch { return []; }
-  }
-
-  function pickBestNativeResult(codes) {
-    if (codes.length === 1) return codes[0];
-    const frameCenterX = video.videoWidth / 2;
-    const frameCenterY = video.videoHeight / 2;
-    return [...codes].sort((a, b) => scoreNative(b) - scoreNative(a))[0];
-
-    function scoreNative(code) {
-      const box = code._fullBoundingBox || code.boundingBox;
-      if (!box) return 0;
-      const area = box.width * box.height;
-      const centerX = box.x + box.width / 2;
-      const centerY = box.y + box.height / 2;
-      const distance = Math.hypot(centerX - frameCenterX, centerY - frameCenterY);
-      return area - distance * 15;
-    }
-  }
-
-  function scanZxingFrame() {
-    if (!window.ZXing || !video.videoWidth || !video.videoHeight) return;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    const sourceX = Math.floor(vw * 0.06);
-    const sourceY = Math.floor(vh * 0.18);
-    const sourceWidth = Math.floor(vw * 0.88);
-    const sourceHeight = Math.floor(vh * 0.64);
-    const targetWidth = Math.min(1280, sourceWidth);
-    const targetHeight = Math.max(1, Math.round(targetWidth * sourceHeight / sourceWidth));
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
-    context.filter = 'contrast(1.18) brightness(1.04)';
-    context.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, targetWidth, targetHeight);
-    context.filter = 'none';
-
-    const decoded = decodeCanvasWithZxing(canvas);
-    if (!decoded) {
-      fadeDetectedBox();
-      return;
-    }
-    acceptCandidate(decoded.value, decoded.format);
-  }
-
-  function decodeCanvasWithZxing(targetCanvas) {
-    try {
-      const luminance = new ZXing.HTMLCanvasElementLuminanceSource(targetCanvas);
-      const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
-      const hints = new Map();
-      const formats = ZXing.BarcodeFormat;
-      const possible = [
-        formats.QR_CODE, formats.DATA_MATRIX, formats.PDF_417, formats.AZTEC,
-        formats.CODE_128, formats.CODE_39, formats.CODE_93, formats.CODABAR,
-        formats.EAN_13, formats.EAN_8, formats.UPC_A, formats.UPC_E, formats.ITF
-      ].filter(value => value !== undefined);
-      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, possible);
-      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-      const reader = new ZXing.MultiFormatReader();
-      const result = reader.decode(bitmap, hints);
-      if (!result) return null;
-      const numericFormat = result.getBarcodeFormat();
-      const format = Object.keys(formats).find(key => formats[key] === numericFormat) || 'UNKNOWN';
-      return { value: result.getText(), format };
-    } catch { return null; }
-  }
-
-  function acceptCandidate(rawValue, rawFormat) {
-    const value = String(rawValue ?? '').trim();
-    const format = Utils.formatLabel(rawFormat);
-    if (!value) return;
-
-    const now = performance.now();
-    if (candidate.value === value && candidate.format === format && now - candidate.at < 850) {
-      candidate.hits += 1;
-    } else {
-      candidate = { value, format, hits: 1, at: now };
-    }
-    candidate.at = now;
-    setCameraStatus(candidate.hits > 1 ? '已鎖定，正在確認…' : `讀取到 ${format}，確認中…`);
-
-    const isTwoDimensional = ['QR-CODE', 'DATA-MATRIX', 'PDF-417', 'AZTEC'].includes(format);
-    const requiredHits = engine === 'native' && isTwoDimensional ? 1 : 2;
-    if (candidate.hits >= requiredHits) completeResult(value, format);
-  }
-
-  function completeResult(value, format) {
-    scanning = false;
-    const url = Utils.normalizeOpenableUrl(value);
-    const type = Utils.classifyContent(value, format);
-    lastResult = {
-      value, url, format: Utils.formatLabel(format), type,
-      source: 'scan', createdAt: new Date().toISOString()
-    };
-
-    setCameraStatus('掃描完成');
-    pulseDetectedBox();
-    provideFeedback();
-    renderResult(lastResult);
-
-    const saveButton = document.getElementById('saveScanBtn');
-    if (Storage.getSettings().autoSave) {
-      Storage.addHistory(lastResult);
-      saveButton.disabled = true;
-      saveButton.textContent = '已存入歷史';
-      Utils.toast('掃描成功，已加入歷史', 'success');
-    } else {
-      saveButton.disabled = false;
-      saveButton.textContent = '存入歷史';
-      Utils.toast('掃描成功', 'success');
-    }
-  }
-
-  function renderResult(result) {
-    document.getElementById('scanResultType').textContent = result.type;
-    document.getElementById('scanResultFormat').textContent = result.format;
-    document.getElementById('scanResultValue').textContent = result.value;
-    const urlEl = document.getElementById('scanResultUrl');
-    const noUrlEl = document.getElementById('scanNoUrl');
-    const openBtn = document.getElementById('openScanUrlBtn');
-    if (result.url) {
-      urlEl.textContent = result.url;
-      urlEl.href = result.url;
-      urlEl.hidden = false;
-      noUrlEl.hidden = true;
-      openBtn.disabled = false;
-    } else {
-      urlEl.textContent = '';
-      urlEl.removeAttribute('href');
-      urlEl.hidden = true;
-      noUrlEl.hidden = false;
-      openBtn.disabled = true;
-    }
-
-    const meta = document.getElementById('scanResultMeta');
-    meta.replaceChildren(
-      createMetaChip(Utils.sourceLabel(result.source)),
-      createMetaChip(Utils.formatDateTime(result.createdAt)),
-      createMetaChip(engine === 'native' ? '原生辨識' : 'ZXing 辨識')
-    );
-    const card = document.getElementById('scanResultCard');
-    card.hidden = false;
-    setTimeout(() => card.scrollIntoView({ behavior: 'smooth', block: 'start' }), 120);
-  }
-
-  function createMetaChip(text) {
-    const el = document.createElement('span');
-    el.className = 'meta-chip';
-    el.textContent = text;
-    return el;
-  }
-
-  function saveLastResult() {
-    if (!lastResult) return;
-    Storage.addHistory(lastResult);
-    const button = document.getElementById('saveScanBtn');
-    button.disabled = true;
-    button.textContent = '已存入歷史';
-    Utils.toast('已存入歷史', 'success');
-  }
-
-  function continueScan() {
-    if (!running || !stream?.active) {
-      start();
-      return;
-    }
-    document.getElementById('scanResultCard').hidden = true;
-    document.getElementById('detectedBox').hidden = true;
-    resetCandidate();
-    lastResult = null;
-    scanning = true;
-    setCameraStatus('請對準下一個條碼');
-    document.getElementById('cameraCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }
-
-  function resetCandidate() { candidate = { value: '', format: '', hits: 0, at: 0 }; }
-
-  function currentStreamTracksStop() {
-    if (stream) stream.getTracks().forEach(track => track.stop());
-    stream = null;
-    videoTrack = null;
-    if (video) video.srcObject = null;
-  }
-
-  async function stop({ keepResult = false, preserveToken = false } = {}) {
-    if (!preserveToken) lifecycleToken += 1;
-    running = false;
-    scanning = false;
-    processing = false;
-    cancelScheduledLoop();
-    currentStreamTracksStop();
-    torchOn = false;
-    const torchBtn = document.getElementById('torchBtn');
-    if (torchBtn) torchBtn.classList.remove('active');
-    if (video) video.srcObject = null;
-    document.getElementById('zoomPanel')?.setAttribute('hidden', '');
-    document.getElementById('detectedBox')?.setAttribute('hidden', '');
-    if (!keepResult) document.getElementById('scanResultCard')?.setAttribute('hidden', '');
-    releaseWakeLock();
-  }
-
-  function pause() {
-    scanning = false;
-    setCameraStatus('掃描已暫停');
-  }
-
-  function resume() {
-    if (running && stream?.active) {
-      resetCandidate();
-      scanning = true;
-      setCameraStatus('相機已啟動，請對準條碼');
-    } else {
-      start();
-    }
-  }
-
-  async function flipCamera() {
-    if (!navigator.mediaDevices?.enumerateDevices) return;
-    try {
-      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput');
-      if (devices.length > 1) {
-        const currentIndex = devices.findIndex(device => device.deviceId === currentDeviceId);
-        const next = devices[(currentIndex + 1 + devices.length) % devices.length];
-        await start({ deviceId: next.deviceId });
-      } else {
-        facingMode = facingMode === 'environment' ? 'user' : 'environment';
-        await start({ facingMode });
-      }
-    } catch {
-      Utils.toast('無法切換鏡頭', 'error');
-    }
-  }
-
-  async function toggleTorch() {
-    if (!videoTrack?.getCapabilities || !videoTrack.applyConstraints) {
-      Utils.toast('此裝置不支援網頁補光燈', 'error');
-      return;
-    }
-    const capabilities = videoTrack.getCapabilities();
-    if (!capabilities.torch) {
-      Utils.toast('目前鏡頭不支援補光燈', 'error');
-      return;
-    }
-    try {
-      torchOn = !torchOn;
-      await videoTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
-      document.getElementById('torchBtn').classList.toggle('active', torchOn);
-    } catch {
-      torchOn = false;
-      Utils.toast('無法切換補光燈', 'error');
-    }
-  }
-
-  async function refocus() {
-    if (!videoTrack) return;
-    await tuneTrack(videoTrack);
-    const frame = document.getElementById('scanFrame');
-    frame.animate([{ opacity: .55 }, { opacity: 1 }], { duration: 220 });
-    setCameraStatus('重新對焦中…');
-    setTimeout(() => scanning && setCameraStatus('請對準條碼'), 500);
-  }
-
-  function showDetectedBox(box) {
-    if (!box || !video.videoWidth || !video.videoHeight) return;
-    const rect = video.getBoundingClientRect();
-    const videoAspect = video.videoWidth / video.videoHeight;
-    const elementAspect = rect.width / rect.height;
-    let scale;
-    let offsetX = 0;
-    let offsetY = 0;
-    if (videoAspect > elementAspect) {
-      scale = rect.height / video.videoHeight;
-      offsetX = (rect.width - video.videoWidth * scale) / 2;
-    } else {
-      scale = rect.width / video.videoWidth;
-      offsetY = (rect.height - video.videoHeight * scale) / 2;
-    }
-    const el = document.getElementById('detectedBox');
-    el.style.left = `${box.x * scale + offsetX}px`;
-    el.style.top = `${box.y * scale + offsetY}px`;
-    el.style.width = `${Math.max(24, box.width * scale)}px`;
-    el.style.height = `${Math.max(24, box.height * scale)}px`;
-    el.hidden = false;
-    el.dataset.seenAt = String(performance.now());
-  }
-
-  function fadeDetectedBox() {
-    const el = document.getElementById('detectedBox');
-    const seenAt = Number(el.dataset.seenAt || 0);
-    if (!seenAt || performance.now() - seenAt > 260) el.hidden = true;
-  }
-
-  function pulseDetectedBox() {
-    const el = document.getElementById('detectedBox');
-    if (el.hidden) return;
-    el.animate([
-      { transform: 'scale(1)', opacity: 1 },
-      { transform: 'scale(1.04)', opacity: 1 },
-      { transform: 'scale(1)', opacity: .9 }
-    ], { duration: 330 });
-  }
-
-  function provideFeedback() {
-    const settings = Storage.getSettings();
-    if (settings.vibration && navigator.vibrate) navigator.vibrate([45, 35, 90]);
-    if (settings.sound) playBeep();
-  }
-
-  function playBeep() {
-    try {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) return;
-      const audioContext = new AudioContextClass();
-      const oscillator = audioContext.createOscillator();
-      const gain = audioContext.createGain();
-      oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(1320, audioContext.currentTime + .09);
-      gain.gain.setValueAtTime(.0001, audioContext.currentTime);
-      gain.gain.exponentialRampToValueAtTime(.18, audioContext.currentTime + .015);
-      gain.gain.exponentialRampToValueAtTime(.0001, audioContext.currentTime + .13);
-      oscillator.connect(gain).connect(audioContext.destination);
-      oscillator.start();
-      oscillator.stop(audioContext.currentTime + .14);
-      oscillator.addEventListener('ended', () => audioContext.close());
-    } catch { /* autoplay policies may block audio */ }
-  }
-
-  async function requestWakeLock() {
-    if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
-    try { wakeLock = await navigator.wakeLock.request('screen'); }
-    catch { wakeLock = null; }
-  }
-
-  function releaseWakeLock() {
-    if (wakeLock) wakeLock.release().catch(() => {});
-    wakeLock = null;
-  }
-
-  function handleVisibility() {
-    if (document.visibilityState === 'hidden') {
-      pause();
-      releaseWakeLock();
-    } else if (window.App?.currentPage?.() === 'scan') {
-      requestWakeLock();
-      resume();
-    }
-  }
-
-  function setCameraStatus(text) {
-    const el = document.getElementById('cameraStatus');
-    if (el) el.textContent = text;
-  }
-
-  function setEnginePill(text, className = '') {
-    const el = document.getElementById('scanEnginePill');
-    if (!el) return;
-    el.textContent = text;
-    el.className = `status-pill ${className}`.trim();
-  }
-
-  function showPermissionError(message) {
-    document.getElementById('permissionMessage').textContent = message;
-    document.getElementById('permissionNote').hidden = false;
-    setCameraStatus('相機未啟動');
-  }
-
-  function hidePermissionError() {
-    document.getElementById('permissionNote').hidden = true;
-  }
-
-  function cameraErrorMessage(error) {
-    switch (error?.name) {
-      case 'NotAllowedError': return '相機權限被拒絕。請到瀏覽器網站設定允許相機，再按「重新啟動」。';
-      case 'NotFoundError': return '找不到可用相機，請確認裝置鏡頭正常。';
-      case 'NotReadableError': return '相機可能正被其他 App 使用。請關閉其他相機 App 後重試。';
-      case 'OverconstrainedError': return '目前鏡頭不支援要求的模式，請按「重新啟動」改用預設設定。';
-      case 'SecurityError': return '瀏覽器基於安全性禁止相機。請使用 HTTPS 或 GitHub Pages 網址。';
-      default: return `無法啟動相機${error?.message ? `：${error.message}` : ''}`;
-    }
-  }
-
-  function getEngine() { return engine; }
-  function isRunning() { return running; }
-
-  return { init, start, stop, pause, resume, getEngine, isRunning, decodeCanvasWithZxing };
+  function restoreResult(r){if(!r)return;try{result=Storage.normalize(r);renderResult();status('已還原上次結果，按繼續掃描啟動');$('cameraStartOverlay').hidden=false;}catch{}}
+  function diagnostics(){return {engine,processingMs:lastAttempt,worker:Decoder.mode(),nativeFormats:nativeSupported.join(', ')||'無／尚未初始化',camera:track?.getSettings?.()?`${track.getSettings().width} × ${track.getSettings().height}`:'未啟動'};}
+  return {init,start,stop,beep,restoreResult,diagnostics,isBusy:()=>processing||starting,isRunning:()=>running,getResult:()=>result};
 })();

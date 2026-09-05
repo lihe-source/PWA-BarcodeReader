@@ -1,2 +1,3 @@
-const APP_VERSION = 'V2_0';
-const APP_BUILD_DATE = '2026-07-11';
+/* Single release source, shared by the page and service worker. */
+const APP_VERSION = 'V3_0';
+const BUILD_DATE = '2026-09-05';
