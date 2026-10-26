@@ -5,7 +5,7 @@ const Scanner=(()=>{
   let video,canvas,ctx,stream=null,track=null,detector=null,nativeSupported=[];
   let token=0,running=false,scanning=false,starting=false,frameTimer=0,idleTimer=0,lastAttempt=0,failures=0,processing=false,wake=null;
   let result=null,candidate={value:null,hits:0,at:0},engine='未啟動',audio=null,torch=false,deviceId='',sessionCount=0,rejectedAt=0;
-  const seen=new Map();
+  const seen=new Map();let blockedKey='',emptyFrames=0;
   function status(t){$('cameraStatus').textContent=t;}
   function init(){
     video=$('scanVideo');canvas=$('scanCanvas');ctx=canvas.getContext('2d',{willReadFrequently:true});
@@ -17,6 +17,7 @@ const Scanner=(()=>{
     $('shareScanBtn').onclick=()=>result&&Utils.shareText('條碼讀值',result.value);
     $('saveScanBtn').onclick=()=>save();$('openScanUrlBtn').onclick=()=>result&&Utils.openUrl(result.url);
     $('scanResultUrl').onclick=e=>{e.preventDefault();if(result)Utils.openUrl(result.url);};
+    $('incrementScanBtn').onclick=async()=>{if(!result)return;const id=result.id;try{const updated=await Storage.incrementQuantity(id);if(result?.id===id){result=updated;App.saveSessionResult(result);$('scanResultMeta').textContent=`${result.value.length} 字元 · 數量 ${result.quantity} · 已保存`;}Utils.toast('已增加 1 件','success');}catch(e){Utils.busyError(e,'請先保存這筆結果');}};
     $('continuousToggle').onchange=e=>Storage.saveSettings({continuous:e.target.checked}).catch(e=>Utils.busyError(e,'設定未儲存'));
     document.addEventListener('pointerdown',unlockAudio,{once:true});document.addEventListener('keydown',unlockAudio,{once:true});
     document.addEventListener('visibilitychange',()=>{
@@ -33,7 +34,7 @@ const Scanner=(()=>{
     try{nativeSupported=typeof BarcodeDetector.getSupportedFormats==='function'?await BarcodeDetector.getSupportedFormats():nativeNames;const names=nativeNames.filter(f=>nativeSupported.includes(f));return names.length?new BarcodeDetector({formats:names}):null;}catch{return null;}
   }
   async function start(requested=''){
-    const mine=++token;stopResources();starting=true;status('正在啟動相機…');$('permissionNote').hidden=true;$('cameraStartOverlay').hidden=true;
+    const mine=++token;stopResources();blockedKey='';emptyFrames=0;starting=true;status('正在啟動相機…');$('permissionNote').hidden=true;$('cameraStartOverlay').hidden=true;
     let owned=null;
     try{
       if(!navigator.mediaDevices?.getUserMedia)throw new Error('請使用 HTTPS 網址及支援相機的 Safari／Chrome。');
@@ -56,7 +57,7 @@ const Scanner=(()=>{
     $('torchBtn')?.classList.remove('active');$('zoomPanel')?.setAttribute('hidden','');
   }
   function stop(){++token;stopResources();}
-  function schedule(mine){clearTimeout(frameTimer);if(running&&scanning&&mine===token)frameTimer=setTimeout(()=>scanFrame(mine),engine.startsWith('原生')?100:180);}
+  function schedule(mine){clearTimeout(frameTimer);if(running&&scanning&&mine===token)frameTimer=setTimeout(()=>scanFrame(mine),Math.min(600,Math.max(engine.startsWith('原生')?100:180,lastAttempt*.5)));}
   function crop(){
     const vr=video.getBoundingClientRect(),fr=$('scanFrame').getBoundingClientRect();
     const scale=Math.max(vr.width/video.videoWidth,vr.height/video.videoHeight);
@@ -85,7 +86,7 @@ const Scanner=(()=>{
       }
       if(mine!==token||!scanning)return;
       $('scanEnginePill').textContent=engine;
-      if(decoded&&decoded.value.length){failures=0;await accept(decoded,mine);}else failures++;
+      if(decoded&&decoded.value.length){emptyFrames=0;failures=0;await accept(decoded,mine);}else{failures++;if(++emptyFrames>=5)blockedKey='';}
     }catch(e){if(e.name!=='AbortError')failures++;}
     finally{if(mine===token){processing=false;lastAttempt=Math.round(performance.now()-began);schedule(mine);}}
   }
@@ -96,8 +97,8 @@ const Scanner=(()=>{
     if(candidate.value===value&&candidate.format===format&&now-candidate.at<1800)candidate.hits++;else candidate={value,format,hits:1,at:now};candidate.at=now;
     if(candidate.hits<2){status('已讀取，正在交叉確認…');return;}
     const s=Storage.getSettings(),key=JSON.stringify([value,format]);
-    if(s.continuous&&now-(seen.get(key)||0)<s.cooldown*1000){status('重複條碼冷卻中，請換下一個');return;}
-    seen.set(key,now);for(const [k,at]of seen)if(now-at>60000)seen.delete(k);
+    if(s.continuous&&((s.duplicateMode==='leave'&&blockedKey===key)||(s.duplicateMode==='cooldown'&&now-(seen.get(key)||0)<s.cooldown*1000))){status(s.duplicateMode==='leave'?'同碼已接受，請移出辨識框或按數量＋1':'重複條碼冷卻中，請換下一個');return;}
+    blockedKey=key;seen.set(key,now);for(const [k,at]of seen)if(now-at>60000)seen.delete(k);
     candidate={value:null,hits:0,at:0};scanning=false;
     result=Storage.normalize({value,format,source:'scan'});sessionCount++;$('sessionCount').textContent=`本次 ${sessionCount} 筆`;
     renderResult();App.saveSessionResult(result);beep(true);
@@ -114,12 +115,12 @@ const Scanner=(()=>{
     $('scanResultType').textContent=result.type;$('scanResultFormat').textContent=result.format;$('scanResultValue').textContent=result.value;
     $('scanResultMeta').textContent=`${result.value.length} 字元 · ${Utils.formatDateTime(result.createdAt)}`;
     const link=$('scanResultUrl');link.textContent=result.url;link.href=result.url||'#';link.hidden=!result.url;$('scanNoUrl').hidden=Boolean(result.url);$('openScanUrlBtn').disabled=!result.url;
-    $('saveScanBtn').disabled=false;$('saveScanBtn').textContent='存入歷史';
+    $('saveScanBtn').disabled=false;$('saveScanBtn').textContent='存入歷史';$('scanSaveStatus').textContent='尚未保存';$('incrementScanBtn').disabled=true;
   }
   async function save(showToast=true){
     if(!result)return;const entry=result;
-    try{await Storage.addHistory(entry);if(result?.id===entry.id){$('saveScanBtn').disabled=true;$('saveScanBtn').textContent='已存入歷史';}if(showToast)Utils.toast('已存入歷史','success');}
-    catch(e){Utils.busyError(e,'未能保存，請先複製或匯出結果');if(!showToast)throw e;}
+    try{await Storage.addHistory(entry);if(result?.id===entry.id){$('saveScanBtn').disabled=true;$('saveScanBtn').textContent='已存入歷史';$('scanSaveStatus').textContent='✓ 已保存';$('incrementScanBtn').disabled=false;}if(showToast)Utils.toast('已存入歷史','success');}
+    catch(e){$('scanSaveStatus').textContent='保存失敗，請先複製結果';Utils.busyError(e,'未能保存，請先複製或匯出結果');if(!showToast)throw e;}
   }
   function continueScan(){
     if(!running){start(deviceId);return;}clearTimeout(idleTimer);result=null;App.saveSessionResult(null);$('scanResultCard').hidden=true;$('page-scan').classList.remove('has-result');candidate={value:null,hits:0,at:0};scanning=true;requestWake(token);status('請對準下一個條碼');schedule(token);

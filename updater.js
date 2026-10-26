@@ -4,6 +4,7 @@ const Updater=(()=>{
   async function init(){
     $('headerVersion').textContent=APP_VERSION;$('currentVersionText').textContent=APP_VERSION;
     $('checkUpdateBtn').onclick=()=>check(true);$('updateNowBtn').onclick=()=>apply(true);
+    navigator.serviceWorker?.addEventListener('message',e=>{if(e.data?.type==='UPDATE_BLOCKED'){applying=false;$('updateBannerText').textContent='請關閉其他 BarcodePro 視窗，之後會自動更新';waitingTimer=setTimeout(()=>apply(false),3000);}});
     let controlled=Boolean(navigator.serviceWorker?.controller);
     navigator.serviceWorker?.addEventListener('controllerchange',()=>{
       if(!controlled){controlled=true;offlineStatus();return;}
@@ -30,16 +31,16 @@ const Updater=(()=>{
     finally{clearTimeout(timer);checking=false;$('checkUpdateBtn').disabled=false;offlineStatus();}
   }
   function available(){
-    $('updateBanner').hidden=false;$('updateBannerText').textContent='新版本已備妥，操作完成後自動更新';
+    $('updateBanner').hidden=false;$('updateBannerText').textContent='新版本已備妥；停止相機並完成操作後自動更新';
     clearTimeout(waitingTimer);waitingTimer=setTimeout(()=>apply(false),1500);
   }
   async function apply(manual=false){
     if(applying)return;
     if(!reg?.waiting){if(manual)await check(true);return;}
-    if(!App.safeToUpdate()){if(manual)Utils.toast('請先完成輸入或關閉編輯視窗，將自動更新');waitingTimer=setTimeout(()=>apply(false),1500);return;}
+    if(!App.safeToUpdate()){if(manual)Utils.toast('請先停止相機、儲存設定並關閉編輯視窗，之後將自動更新');waitingTimer=setTimeout(()=>apply(false),1500);return;}
     applying=true;
     if(!App.checkpoint()){applying=false;$('updateBannerText').textContent='無法暫存操作，請先匯出資料並重新開啟；不會強制更新';return;}
-    Scanner.stop();reg.waiting.postMessage({type:'SKIP_WAITING'});
+    Scanner.stop();reg.waiting.postMessage({type:'SKIP_WAITING'});setTimeout(()=>{if(!reloading){applying=false;$('updateBannerText').textContent='更新尚未完成，可按套用更新重試；資料保持不變';}},15000);
   }
   function queueReload(){
     if(reloading)return;reloading=true;

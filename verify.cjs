@@ -13,6 +13,8 @@ function fakeIDB(){
     transaction(names,mode='readonly'){
       const db=this;let aborted=false,started=false,processing=false;const ops=[];let state;
       const tx={error:null,oncomplete:null,onabort:null,onerror:null,abort(){if(aborted)return;aborted=true;tx.error=tx.error||new Error('Abort');finish(false);},objectStore(n){return {
+        index:()=>({openCursor(_range,direction){const req={};let list,at=0;
+          const emit=()=>{const tick=enqueue(()=>{list??=[...state.get(n).values()].sort((a,b)=>direction==='prev'?b.createdAt.localeCompare(a.createdAt):a.createdAt.localeCompare(b.createdAt));return list[at++]||null;});tick.onsuccess=()=>{req.result=tick.result?{value:tick.result,continue:emit}:null;req.onsuccess?.();};};emit();return req;}}),
         get:k=>enqueue(()=>state.get(n).get(k)),getAll:()=>enqueue(()=>[...state.get(n).values()]),count:()=>enqueue(()=>state.get(n).size),
         put:r=>enqueue(()=>{if(failWrite){failWrite=false;throw new Error('QuotaExceededError');}state.get(n).set(r[db.keys.get(n)],structuredClone(r));return r[db.keys.get(n)];}),
         delete:k=>enqueue(()=>state.get(n).delete(k)),clear:()=>enqueue(()=>state.get(n).clear())
@@ -55,7 +57,7 @@ function pixels(bcid,text){
     const navs=pages.map(p=>{const e=new Element('button');e.dataset.pageTarget=p.dataset.page;e.classList.add('nav-item');return e;});
     const header=els.get('headerVersion');header.dataset.pageTarget='settings';
     const defaults={generateFormat:'QR-CODE',historyFilter:'all',themeSelect:'dark',allowedFormat:'all',printWidth:'60',printHeight:'40'};for(const [id,value]of Object.entries(defaults))els.get(id).value=value;
-    const events=new Map(),local=new Map(),session=new Map();
+    const events=new Map(),local=new Map(),session=new Map();session.set('barcodepro.v3.session',JSON.stringify({fields:{prefixInput:'STALE-DRAFT'}}));
     const doc={getElementById:id=>els.get(id)||null,createElement:t=>new Element(t),addEventListener(){},querySelectorAll:q=>q==='.page'?pages:q==='[data-page-target]'?[header,...navs]:[],querySelector:q=>q==='dialog[open]'?null:new Element('meta'),activeElement:{tagName:'BODY'},body:new Element('body'),documentElement:new Element('html'),hidden:false};
     const win={addEventListener:(n,fn)=>{if(!events.has(n))events.set(n,[]);events.get(n).push(fn);},dispatchEvent:e=>(events.get(e.type)||[]).forEach(fn=>fn(e)),scrollTo(){}};
     const c=vm.createContext({console:{...console,warn(){},error(){}},document:doc,window:win,navigator:{onLine:true},indexedDB:fakeIDB(),localStorage:{getItem:k=>local.get(k)??null,setItem:(k,v)=>local.set(k,v)},sessionStorage:{getItem:k=>session.get(k)??null,setItem:(k,v)=>session.set(k,v)},location:{search:''},matchMedia:()=>({matches:false,addEventListener(){}}),CustomEvent:class{constructor(type,options){this.type=type;this.detail=options?.detail;}},URL,URLSearchParams,Map,Date,Math,Intl,setTimeout,clearTimeout,DOMException,Uint8ClampedArray,performance,crypto:require('node:crypto').webcrypto,bwipjs:{toCanvas(canvas){canvas.width=128;canvas.height=128;}}});
@@ -65,6 +67,30 @@ function pixels(bcid,text){
     vm.runInContext('App.navigate("generate"); Generator.focusValue("  ABC123\\n","CODE-128")',c);assert.equal(els.get('generateValue').value,'  ABC123\n');assert.equal(els.get('generateFormat').value,'CODE-128');assert.equal(els.get('generateError').hidden,true);
     for(const page of ['history','settings','import'])vm.runInContext(`App.navigate('${page}')`,c);
     assert.equal(vm.runInContext('App.checkpoint()',c),true);assert.equal(vm.runInContext('App.safeToUpdate()',c),true);assert(local.has('barcodepro.v3.draft'));assert(session.has('barcodepro.v3.session'));
+    await ok('stale session settings no longer override effective rules',()=>assert.equal(els.get('prefixInput').value,''));
+    await ok('active camera inter-frame gap blocks automatic update',()=>{
+      vm.runInContext('window.originalRunning=Scanner.isRunning;Scanner.isRunning=()=>true',c);assert.equal(vm.runInContext('App.safeToUpdate()',c),false);vm.runInContext('Scanner.isRunning=window.originalRunning',c);
+    });
+    await ok('unsaved settings survive toggle changes and cancel restores active value',async()=>{
+      els.get('prefixInput').value='DRAFT';els.get('prefixInput').listeners.input();assert.equal(vm.runInContext('App.safeToUpdate()',c),false);
+      await vm.runInContext('Storage.saveSettings({sound:false})',c);assert.equal(els.get('prefixInput').value,'DRAFT');assert.equal(vm.runInContext('Storage.getSettings().prefix',c),'');
+      els.get('cancelRulesBtn').click();assert.equal(els.get('prefixInput').value,'');assert.equal(vm.runInContext('App.safeToUpdate()',c),true);
+    });
+    await ok('continuous mode rejects held code, allows a different code and increments stored quantity',async()=>{
+      // Expose a narrow test hook only in this VM; production Scanner has no test API.
+      vm.runInContext(read('scanner.js').replace('const Scanner=','const TestScanner=').replace('return {init,start,','return {acceptForTest:accept,init,start,'),c);
+      vm.runInContext('window.savedSession=App.saveSessionResult;App.saveSessionResult=()=>{}',c);
+      await vm.runInContext('Storage.saveSettings({continuous:true,duplicateMode:"leave",sound:false})',c);
+      for(let i=0;i<4;i++)await vm.runInContext('TestScanner.acceptForTest({value:"HOLD",format:"CODE-128"},-1)',c);
+      assert.equal(await vm.runInContext('Storage.count()',c),1);
+      for(let i=0;i<2;i++)await vm.runInContext('TestScanner.acceptForTest({value:"NEXT",format:"CODE-128"},-1)',c);
+      assert.equal(await vm.runInContext('Storage.count()',c),2);
+      vm.runInContext('App.saveSessionResult=window.savedSession',c);
+    });
+    await ok('history changes while hidden do not query the database',()=>{
+      vm.runInContext('window.originalQuery=Storage.queryHistory;window.reads=0;Storage.queryHistory=()=>{window.reads++;return Promise.resolve({rows:[],total:0,matched:0,quantity:0,categories:[]})};window.dispatchEvent(new CustomEvent("barcode-history-changed"))',c);
+      assert.equal(vm.runInContext('window.reads',c),0);vm.runInContext('Storage.queryHistory=window.originalQuery',c);
+    });
   });
   const {c,idb,memory,run}=context();
   run('Utils.toast=()=>{}');
@@ -75,6 +101,36 @@ function pixels(bcid,text){
   await ok('quota failure rolls back and clears busy state',async()=>{const before=await run('Storage.count()');idb.fail();await assert.rejects(run('Storage.addHistory({value:"quota-test",source:"scan"})'));assert.equal(await run('Storage.count()'),before);assert.equal(run('Storage.isBusy()'),false);});
   await ok('delete and undo preserves record IDs',async()=>{c.deleted=await run('Storage.removeHistory("old-1")');assert.equal(c.deleted.length,1);await run('Storage.restoreDeleted(deleted)');assert.equal((await run('Storage.getHistory()')).find(r=>r.id==='old-1').value,'  00123\n');});
   await ok('serialized settings, continuous autosave and validation rules',async()=>{await Promise.all([run('Storage.saveSettings({continuous:true})'),run('Storage.saveSettings({prefix:"ABC",minLength:5,maxLength:8,format:"CODE-128"})')]);const s=run('Storage.getSettings()');assert(s.continuous&&s.autoSave);assert(run('Storage.validate("00123","CODE-128")'));assert.equal(run('Storage.validate("ABC12","CODE-128")'),'');});
+  await ok('cursor pages preserve ordering, filters and numeric totals',async()=>{
+    const first=await run('Storage.queryHistory({},1,30)'),second=await run('Storage.queryHistory({},2,30)');
+    assert.equal(first.rows.length,30);assert.equal(second.rows.length,30);assert.equal(first.total,551);
+    assert(!first.rows.some(a=>second.rows.some(b=>a.id===b.id)));assert(first.rows[0].createdAt>=first.rows[29].createdAt);
+    const filtered=await run('Storage.queryHistory({q:"00123",source:"scan"})');assert(filtered.matched>=1);assert(filtered.rows.every(r=>r.value.includes('00123')));
+  });
+  await ok('restore detects note/quantity conflicts and respects chosen policy',async()=>{
+    await run('Storage.addHistory({id:"conflict-1",value:"CONFLICT",format:"CODE-128",note:"old",quantity:1,createdAt:"2026-01-01T00:00:00Z"})');
+    c.incoming={app:'BarcodePro',schema:4,history:[{id:'conflict-1',value:'CONFLICT',format:'CODE-128',note:'new',quantity:9,createdAt:'2026-01-01T00:00:00Z'}]};
+    const preview=await run('Storage.previewRestore(incoming)');assert.equal(preview.conflicts,1);
+    const keep=await run('Storage.restore(incoming)');assert.equal(keep.updated,0);
+    assert.equal((await run('Storage.getHistory()')).find(r=>r.id==='conflict-1').quantity,1);
+    const update=await run('Storage.restore(incoming,{conflict:"backup",snapshot:true})');assert.equal(update.updated,1);
+    assert.equal((await run('Storage.getHistory()')).find(r=>r.id==='conflict-1').note,'new');
+    assert.equal((await run('Storage.getMeta("pre-restore")')).history.find(r=>r.id==='conflict-1').quantity,1);
+  });
+  await ok('concurrent quantity increments are atomic',async()=>{
+    await Promise.all([run('Storage.incrementQuantity("conflict-1")'),run('Storage.incrementQuantity("conflict-1")')]);
+    assert.equal((await run('Storage.getHistory()')).find(r=>r.id==='conflict-1').quantity,11);
+    await assert.rejects(run('Storage.incrementQuantity("missing-id")'));
+  });
+  await ok('malformed legacy migration leaves recovery data and new storage usable',async()=>{
+    const other=context();other.run('Utils.toast=()=>{};Utils.report=()=>{}');other.memory.set('barcodepro.history.v2','invalid-json');await other.run('Storage.init()');
+    assert(other.run('window.migrationWarning'));assert.equal(other.memory.get('barcodepro.history.v2'),'invalid-json');
+    await other.run('Storage.addHistory({value:"new-record"})');assert.equal(await other.run('Storage.count()'),1);
+  });
+  await ok('actionable notifications and fixed continuous camera CSS',()=>{
+    assert.match(read('styles.css'),/\.toast\{pointer-events:auto\}/);assert.match(read('styles.css'),/\.continuous\.has-result \.camera-card/);
+    assert(!read('index.html').includes('<script src="bwip-js.min.js" defer>'));
+  });
   await ok('URL allowlist and CSV formula / long identifier protection',()=>{assert.equal(run('Utils.normalizeOpenableUrl("javascript:alert(1)")'),'');assert.equal(run('Utils.normalizeOpenableUrl("text https://example.com")'),'');assert.equal(run('Utils.normalizeOpenableUrl("https://example.com")'),'https://example.com/');for(const v of ['=1+1','001234567890123456789','\t=1','+cmd']){c.value=v;assert(run('Utils.escapeCsv(value)').startsWith('"\''));}});
   await ok('EAN check digit and semantic version comparison',()=>{assert.equal(run('Generator.normalizeEAN("400638133393","EAN-13")'),'4006381333931');assert.throws(()=>run('Generator.normalizeEAN("4006381333932","EAN-13")'));assert(run('Updater.compare("V3_10","V3_2")')>0);assert.equal(run('Updater.compare("V3_0","V3.0.0")'),0);});
   await ok('all eight production renderer option sets accepted by bundled bwip-js',()=>{
@@ -82,11 +138,14 @@ function pixels(bcid,text){
   });
   for(const [bcid,value]of [['qrcode','  Rex\n'],['datamatrix','001234567890'],['pdf417','PCBA-AOI-2026'],['code128','001234567890'],['code39','SMT-001'],['ean13','4006381333931'],['ean8','96385074'],['upca','036000291452']])await ok(`${bcid} bundled encoder -> pixel raster -> ZXing round-trip`,()=>{const p=pixels(bcid,value);c.pixels=p.data;c.w=p.w;c.h=p.h;const decoded=run('DecoderCore.decode(pixels,w,h,{hard:true})');assert(decoded,bcid);assert.equal(decoded.value,value);});
   await ok('service worker install completeness, cache isolation, offline response',async()=>{
-    const handlers={},maps=new Map(),deleted=[];const base='https://lihe-source.github.io/PWA-BarcodeReader/';let offline=false;
+    const handlers={},maps=new Map(),deleted=[];const base='https://lihe-source.github.io/PWA-BarcodeReader/';let offline=false,tamper=false,clientCount=0,activated=0;
     const caches={open:async name=>{if(!maps.has(name))maps.set(name,new Map());const m=maps.get(name);return {put:async(k,r)=>m.set(k,r),match:async k=>m.get(k)?.clone()};},keys:async()=>[...maps.keys()],delete:async n=>{deleted.push(n);return maps.delete(n);}};
     maps.set('japanese-app-v1',new Map());maps.set('calendar-app-v1',new Map());maps.set('barcodepro-v2_0',new Map());
-    const sw=vm.createContext({URL,Response,Promise,caches,importScripts(){},self:{registration:{scope:base},location:{origin:'https://lihe-source.github.io'},addEventListener:(n,fn)=>handlers[n]=fn,clients:{claim:async()=>{}},skipWaiting(){}},fetch:async u=>{if(offline)throw new Error('Offline');const filename=new URL(typeof u==='string'?u:u.url).pathname.split('/').at(-1)||'index.html';return new Response(fs.existsSync(path.join(root,filename))?read(filename):'',{status:fs.existsSync(path.join(root,filename))?200:404});}});
-    vm.runInContext(read('version.js'),sw);vm.runInContext(read('service-worker.js'),sw);let job;handlers.install({waitUntil:p=>job=p});await job;handlers.activate({waitUntil:p=>job=p});await job;assert.deepEqual(deleted,['barcodepro-v2_0']);assert(maps.has('japanese-app-v1'));assert(maps.has('calendar-app-v1'));
+    const sw=vm.createContext({URL,Response,Promise,caches,Uint8Array,crypto:require('node:crypto').webcrypto,importScripts(){},self:{registration:{scope:base},location:{origin:'https://lihe-source.github.io'},addEventListener:(n,fn)=>handlers[n]=fn,clients:{claim:async()=>{},matchAll:async()=>Array.from({length:clientCount},()=>({url:base}))},skipWaiting(){activated++;}},fetch:async u=>{if(offline)throw new Error('Offline');const filename=new URL(typeof u==='string'?u:u.url).pathname.split('/').at(-1)||'index.html';return new Response(fs.existsSync(path.join(root,filename))?(tamper&&filename==='scanner.js'?'wrong-build':fs.readFileSync(path.join(root,filename))):'',{status:fs.existsSync(path.join(root,filename))?200:404});}});
+    vm.runInContext(read('version.js'),sw);vm.runInContext(read('release-manifest.js'),sw);vm.runInContext(read('service-worker.js'),sw);let job;handlers.install({waitUntil:p=>job=p});await job;handlers.activate({waitUntil:p=>job=p});await job;assert.deepEqual(deleted,['barcodepro-v2_0']);assert(maps.has('japanese-app-v1'));assert(maps.has('calendar-app-v1'));
+    let blocked=false;clientCount=2;handlers.message({data:{type:'SKIP_WAITING'},source:{postMessage:m=>blocked=m.type==='UPDATE_BLOCKED'},waitUntil:p=>job=p});await job;assert(blocked);assert.equal(activated,0);
+    clientCount=1;handlers.message({data:{type:'SKIP_WAITING'},waitUntil:p=>job=p});await job;assert.equal(activated,1);
+    tamper=true;handlers.install({waitUntil:p=>job=p});await assert.rejects(job,/integrity mismatch/);tamper=false;
     offline=true;let response;handlers.fetch({request:{url:base+'version.json?t=123',method:'GET',mode:'cors'},respondWith:p=>response=p});assert.equal((await response).status,503);
     handlers.fetch({request:{url:base+'?source=pwa',method:'GET',mode:'navigate'},respondWith:p=>response=p});assert((await (await response).text()).includes('BarcodePro'));
     maps.get('barcodepro-reader-'+vm.runInContext('APP_VERSION',sw)).delete(base+'scanner.js');handlers.fetch({request:{url:base+'scanner.js',method:'GET',mode:'cors'},respondWith:p=>response=p});assert.equal((await response).status,503);

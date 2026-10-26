@@ -22,12 +22,21 @@ const Generator=(()=>{
     if(format==='QR-CODE')options.eclevel='M';
     return options;
   }
-  function render(){
+  let libraryPromise=null;
+  function loadLibrary(){
+    if(typeof bwipjs!=='undefined')return Promise.resolve();
+    if(!libraryPromise)libraryPromise=new Promise((resolve,reject)=>{
+      const script=document.createElement('script'),timer=setTimeout(()=>{script.remove();libraryPromise=null;reject(new Error('產碼套件載入逾時，請確認離線資源或連線後重試。'));},15000);
+      script.src='./bwip-js.min.js';script.onload=()=>{clearTimeout(timer);resolve();};script.onerror=()=>{clearTimeout(timer);script.remove();libraryPromise=null;reject(new Error('產碼套件尚未備妥，請連線後重試。'));};document.head.append(script);
+    });return libraryPromise;
+  }
+  async function render(){
     invalidate();const value=$('generateValue').value,format=$('generateFormat').value,c=$('barcodeCanvas');$('generateError').hidden=true;c.hidden=true;$('barcodePlaceholder').hidden=false;
     if(!value.length)return;
     try{
       if(value.length>4000)throw new Error('內容上限 4,000 字元；實際可編碼容量依格式而異。');
-      const actual=normalizeEAN(value,format);
+      const actual=normalizeEAN(value,format),mine=epoch;
+      if(typeof bwipjs==='undefined'){busy=true;$('barcodePlaceholder').textContent='載入本機產碼套件…';try{await loadLibrary();}finally{if(mine===epoch)busy=false;}if(mine!==epoch)return;}
       bwipjs.toCanvas(c,optionsFor(format,actual));
       record=Storage.normalize({value:actual,format,source:'generate'});c.hidden=false;$('barcodePlaceholder').hidden=true;buttons(true);
       $('generateNote').textContent=actual!==value?`已自動補上檢查碼，實際內容：${actual}`:'原始空白與換行會保留；尺寸不足時請縮短內容。';
@@ -38,7 +47,7 @@ const Generator=(()=>{
   async function save(){if(!record)return;const r=record;try{await Storage.addHistory(r);if(record===r)$('saveBarcodeBtn').disabled=true;Utils.toast('已存入歷史','success');}catch(e){Utils.busyError(e,'儲存失敗');}}
   async function verify(){
     if(!record)return;const r=record,mine=epoch;busy=true;$('verifyStatus').textContent='正在回讀驗證…';$('verifyBarcodeBtn').disabled=true;
-    try{const read=await Decoder.decode($('barcodeCanvas'),{hard:true,format:r.format});if(mine!==epoch)return;$('verifyStatus').textContent=read?.value===r.value?'✓ 回讀內容完全一致':'未通過回讀；請調整內容或尺寸並用實機驗證，勿直接用於正式標籤。';}
+    try{const read=await Decoder.decode($('barcodeCanvas'),{hard:true,format:r.format});if(mine!==epoch)return;$('verifyStatus').textContent=read?.value===r.value&&Utils.formatLabel(read.format)===r.format?'✓ 回讀內容完全一致':'未通過回讀；請調整內容或尺寸並用實機驗證，勿直接用於正式標籤。';}
     catch(e){if(mine===epoch)$('verifyStatus').textContent='此次無法驗證，請重試。';}
     finally{if(mine===epoch){busy=false;$('verifyBarcodeBtn').disabled=false;}}
   }
@@ -47,7 +56,7 @@ const Generator=(()=>{
     const width=Number($('printWidth').value),height=Number($('printHeight').value),c=$('barcodeCanvas');
     if(width<20||width>210||height<15||height>297){Utils.toast('寬度須為 20–210 mm，高度須為 15–297 mm','error');return;}
     const area=$('printArea');area.replaceChildren();const img=document.createElement('img');img.src=c.toDataURL('image/png');img.style.maxWidth=`${width-4}mm`;img.style.maxHeight=`${height-4}mm`;area.style.width=`${width}mm`;area.style.height=`${height}mm`;area.append(img);
-    await img.decode();window.print();
+    exporting++;try{await img.decode();window.print();}catch(e){Utils.busyError(e,'列印失敗');}finally{exporting--;}
   }
   function focusValue(value='',format='QR-CODE'){
     if(!formats[Utils.formatLabel(format)]){Utils.toast('此格式不支援重新產生，已保留原紀錄','error');return false;}
