@@ -1,3 +1,8 @@
+#scanResultDialog{width:min(560px,calc(100% - 24px));max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 32px);overscroll-behavior:contain}
+#scanResultDialog .result-head{align-items:center}#scanResultDialog h2{margin:0}
+#popupResultValue{max-height:36dvh;min-height:72px;white-space:pre-wrap;overflow-wrap:anywhere}
+#popupOpenLink{display:flex;align-items:center;justify-content:center;text-decoration:none;text-align:center}
+#scanResultDialog .action-grid{grid-template-columns:1fr}#scanResultDialog .note{font-size:14px}
 :root {
   color-scheme: dark;
   --bg: #070b14;

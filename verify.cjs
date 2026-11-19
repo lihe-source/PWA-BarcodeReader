@@ -58,7 +58,7 @@ function pixels(bcid,text){
     const header=els.get('headerVersion');header.dataset.pageTarget='settings';
     const defaults={generateFormat:'QR-CODE',historyFilter:'all',themeSelect:'dark',allowedFormat:'all',printWidth:'60',printHeight:'40'};for(const [id,value]of Object.entries(defaults))els.get(id).value=value;
     const events=new Map(),local=new Map(),session=new Map();session.set('barcodepro.v3.session',JSON.stringify({fields:{prefixInput:'STALE-DRAFT'}}));
-    const doc={getElementById:id=>els.get(id)||null,createElement:t=>new Element(t),addEventListener(){},querySelectorAll:q=>q==='.page'?pages:q==='[data-page-target]'?[header,...navs]:[],querySelector:q=>q==='dialog[open]'?null:new Element('meta'),activeElement:{tagName:'BODY'},body:new Element('body'),documentElement:new Element('html'),hidden:false};
+    const doc={getElementById:id=>els.get(id)||null,createElement:t=>new Element(t),addEventListener(){},querySelectorAll:q=>q==='.page'?pages:q==='[data-page-target]'?[header,...navs]:[],querySelector:q=>q==='dialog[open]'?[...els.values()].find(e=>e.tagName==='DIALOG'&&e.open)||null:new Element('meta'),activeElement:{tagName:'BODY'},body:new Element('body'),documentElement:new Element('html'),hidden:false};
     const win={addEventListener:(n,fn)=>{if(!events.has(n))events.set(n,[]);events.get(n).push(fn);},dispatchEvent:e=>(events.get(e.type)||[]).forEach(fn=>fn(e)),scrollTo(){}};
     const c=vm.createContext({console:{...console,warn(){},error(){}},document:doc,window:win,navigator:{onLine:true},indexedDB:fakeIDB(),localStorage:{getItem:k=>local.get(k)??null,setItem:(k,v)=>local.set(k,v)},sessionStorage:{getItem:k=>session.get(k)??null,setItem:(k,v)=>session.set(k,v)},location:{search:''},matchMedia:()=>({matches:false,addEventListener(){}}),CustomEvent:class{constructor(type,options){this.type=type;this.detail=options?.detail;}},URL,URLSearchParams,Map,Date,Math,Intl,setTimeout,clearTimeout,DOMException,Uint8ClampedArray,performance,crypto:require('node:crypto').webcrypto,bwipjs:{toCanvas(canvas){canvas.width=128;canvas.height=128;}}});
     for(const f of ['version.js','utils.js','storage.js','decoder-core.js','decoder.js','scanner.js','importer.js','generator.js','history.js','updater.js','app.js'])vm.runInContext(read(f),c,{filename:f});
@@ -83,9 +83,31 @@ function pixels(bcid,text){
       await vm.runInContext('Storage.saveSettings({continuous:true,duplicateMode:"leave",sound:false})',c);
       for(let i=0;i<4;i++)await vm.runInContext('TestScanner.acceptForTest({value:"HOLD",format:"CODE-128"},-1)',c);
       assert.equal(await vm.runInContext('Storage.count()',c),1);
+      assert.equal(els.get('scanResultDialog').open,true);
+      assert.equal(els.get('popupResultValue').textContent,'HOLD');
+      assert.equal(els.get('popupOpenLink').hidden,true);
+      assert.equal(vm.runInContext('App.safeToUpdate()',c),false);
+      await vm.runInContext('TestScanner.acceptForTest({value:"BLOCKED",format:"CODE-128"},-1)',c);
+      assert.equal(await vm.runInContext('Storage.count()',c),1);
+      els.get('scanResultDialog').close();
       for(let i=0;i<2;i++)await vm.runInContext('TestScanner.acceptForTest({value:"NEXT",format:"CODE-128"},-1)',c);
       assert.equal(await vm.runInContext('Storage.count()',c),2);
-      vm.runInContext('App.saveSessionResult=window.savedSession',c);
+      els.get('scanResultDialog').close();vm.runInContext('App.saveSessionResult=window.savedSession',c);
+    });
+    await ok('result modal preserves raw text and copies without trimming',async()=>{
+      vm.runInContext('Scanner.restoreResult({value:"  00123\\n",format:"CODE-128"});window.copyOriginal=Utils.copyText;Utils.copyText=async text=>{window.copied=text;return true}',c);
+      els.get('showScanResultBtn').click();assert.equal(els.get('popupResultValue').textContent,'  00123\n');
+      await els.get('popupCopyBtn').onclick();assert.equal(vm.runInContext('window.copied',c),'  00123\n');
+      assert.equal(els.get('popupOpenLink').hidden,true);els.get('popupCloseBtn').click();assert.equal(els.get('scanResultDialog').open,false);
+      assert.equal(vm.runInContext('Scanner.getResult().value',c),'  00123\n');vm.runInContext('Utils.copyText=window.copyOriginal',c);
+    });
+    await ok('HTTP URL gets direct safe anchor; script URL has no open action',()=>{
+      vm.runInContext('Scanner.restoreResult({value:"https://example.com/a?x=1",format:"QR-CODE"})',c);els.get('showScanResultBtn').click();
+      assert.equal(els.get('popupOpenLink').hidden,false);assert.equal(els.get('popupOpenLink').href,'https://example.com/a?x=1');
+      assert.match(read('index.html'),/id="popupOpenLink"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/);
+      els.get('popupCloseBtn').click();
+      vm.runInContext('Scanner.restoreResult({value:"javascript:alert(1)",format:"QR-CODE"})',c);els.get('showScanResultBtn').click();assert.equal(els.get('popupOpenLink').hidden,true);
+      let prevented=false;els.get('scanResultDialog').listeners.cancel({preventDefault(){prevented=true;}});assert(prevented);assert.equal(els.get('scanResultDialog').open,false);
     });
     await ok('history changes while hidden do not query the database',()=>{
       vm.runInContext('window.originalQuery=Storage.queryHistory;window.reads=0;Storage.queryHistory=()=>{window.reads++;return Promise.resolve({rows:[],total:0,matched:0,quantity:0,categories:[]})};window.dispatchEvent(new CustomEvent("barcode-history-changed"))',c);

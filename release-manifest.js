@@ -1,5 +1,5 @@
 /* Generated: do not edit manually. */
-const RELEASE_VERSION = 'V3_1';
+const RELEASE_VERSION = 'V3_2';
 const RELEASE_HASHES = {
   "app.js": "220954538e8f9fbbf178e7dfe42478db4e12fb343b7836cef2ef1a2932cb7c51",
   "bwip-js.min.js": "c9fcfad6ef26c0e7aad79fb98b99a9cf1881d81d6a646999c9ba4bfbb0fb2fae",
@@ -12,13 +12,13 @@ const RELEASE_HASHES = {
   "icon-512.png": "31fe115b8ea2ea124043d8cd5611e0ce8756b19e9d5f5bb18a221930bb7c93ea",
   "icon-maskable-512.png": "46fccbad055c956bea50e9e5160854fb934c23ec261a6c8e6eb1e142f5065d31",
   "importer.js": "4d307992d3b6a50eb6a96b23d62aff0e97fcbda0929bf822cf211ba52845e208",
-  "index.html": "a9d557cc042526262420a8ba64211c0545e9b6049a2c757e59fddc2790323e9a",
+  "index.html": "6d201ae0e12d6dc620863eab51345c2c618a72d2157984c736002588ebd179f5",
   "manifest.json": "53d484de0c35349188f93f527b192e5ffb06cb124189fb32b4b1400d741b67ee",
-  "scanner.js": "bc0f36e369f4b1e5009e44dd4ecadc979175fe6f39ff334540761f8e7e267240",
+  "scanner.js": "1e918dc8b782e581227bbc2cf7f56eecff3baf4615f634ebd5378d68b9e0123d",
   "storage.js": "bdad3a363f6840b1e04133be9f6691c30265737e7099ad0834c9c560102b3e98",
-  "styles.css": "c2dfc87ea2115c4c2c3619b69be6e78d05dfe26a9eb9e3a8dff59123d055ec9d",
+  "styles.css": "5e6b7bff454ea950d9196ae14a470298d911b02882d3546478662d92b7867425",
   "updater.js": "b740dacdef9a802287eb8365c8efe57760ecb8259c34e2d61e80036c2e21fb77",
-  "utils.js": "b2456a2332d46190e4992e489db8229f35c001653050cd885eda5de22383c99e",
-  "version.js": "cb04bd18f2861b35038e62f61dd27111c73d9757ffb8e8c6ab0274f367c3ee1d",
+  "utils.js": "92fbfba86a4f65225eabc95488fe8a1f76c08ef04f1b3feb098195aa97c0e703",
+  "version.js": "2ed2b1e230e241ffdb23ed6214bcb1fc8ffd52bbd51a63a8807fb899354bf4b0",
   "zxing.min.js": "d7cc8f69dd70bdcf3ac00c9ae572bf2acb9f4132ba379c72df842e4db918652d"
 };

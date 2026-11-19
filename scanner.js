@@ -5,6 +5,7 @@ const Scanner=(()=>{
   let video,canvas,ctx,stream=null,track=null,detector=null,nativeSupported=[];
   let token=0,running=false,scanning=false,starting=false,frameTimer=0,idleTimer=0,lastAttempt=0,failures=0,processing=false,wake=null;
   let result=null,candidate={value:null,hits:0,at:0},engine='未啟動',audio=null,torch=false,deviceId='',sessionCount=0,rejectedAt=0;
+  let resultSaving=false;
   const seen=new Map();let blockedKey='',emptyFrames=0;
   function status(t){$('cameraStatus').textContent=t;}
   function init(){
@@ -12,6 +13,11 @@ const Scanner=(()=>{
     $('cameraStartOverlay').onclick=()=>start();$('retryCameraBtn').onclick=()=>start();
     $('flipCameraBtn').onclick=()=>flip();$('cameraSelect').onchange=e=>start(e.target.value);
     $('torchBtn').onclick=()=>toggleTorch();$('zoomRange').oninput=Utils.debounce(e=>zoom(Number(e.target.value)),100);
+    $('popupCopyBtn').onclick=async()=>{if(!result)return;const ok=await Utils.copyText(result.value);$('popupCopyStatus').textContent=ok?'已複製完整原始內容':'無法自動複製，請長按上方文字手動複製';};
+    $('popupCloseBtn').onclick=()=>{stop();$('scanResultDialog').close();status('結果已保留，按繼續掃描啟動');$('cameraStartOverlay').hidden=false;};
+    $('scanResultDialog').addEventListener('cancel',e=>{e.preventDefault();$('popupCloseBtn').click();});
+    $('popupContinueBtn').onclick=()=>continueScan();
+    $('showScanResultBtn').onclick=()=>showResultDialog();
     $('continueScanBtn').onclick=()=>continueScan();$('pauseCameraBtn').onclick=()=>{stop();status('已停止相機');$('cameraStartOverlay').hidden=false;};
     $('copyScanBtn').onclick=()=>result&&Utils.copyText(result.value);
     $('shareScanBtn').onclick=()=>result&&Utils.shareText('條碼讀值',result.value);
@@ -34,6 +40,7 @@ const Scanner=(()=>{
     try{nativeSupported=typeof BarcodeDetector.getSupportedFormats==='function'?await BarcodeDetector.getSupportedFormats():nativeNames;const names=nativeNames.filter(f=>nativeSupported.includes(f));return names.length?new BarcodeDetector({formats:names}):null;}catch{return null;}
   }
   async function start(requested=''){
+    if($('scanResultDialog').open||resultSaving)return;
     const mine=++token;stopResources();blockedKey='';emptyFrames=0;starting=true;status('正在啟動相機…');$('permissionNote').hidden=true;$('cameraStartOverlay').hidden=true;
     let owned=null;
     try{
@@ -91,6 +98,7 @@ const Scanner=(()=>{
     finally{if(mine===token){processing=false;lastAttempt=Math.round(performance.now()-began);schedule(mine);}}
   }
   async function accept(decoded,mine){
+    if($('scanResultDialog').open||resultSaving)return;
     const value=String(decoded.value),format=Utils.formatLabel(decoded.format),now=Date.now();
     const reason=Storage.validate(value,format);
     if(reason){status(reason);if(now-rejectedAt>1800){beep(false);rejectedAt=now;}return;}
@@ -101,14 +109,26 @@ const Scanner=(()=>{
     blockedKey=key;seen.set(key,now);for(const [k,at]of seen)if(now-at>60000)seen.delete(k);
     candidate={value:null,hits:0,at:0};scanning=false;
     result=Storage.normalize({value,format,source:'scan'});sessionCount++;$('sessionCount').textContent=`本次 ${sessionCount} 筆`;
-    renderResult();App.saveSessionResult(result);beep(true);
+    renderResult();showResultDialog();App.saveSessionResult(result);beep(true);
     if(s.vibration&&navigator.vibrate)navigator.vibrate(60);
     let saved=false;
-    if(s.autoSave){try{await save(false);saved=true;}catch{}}
+    if(s.autoSave){resultSaving=true;$('popupContinueBtn').disabled=true;try{await save(false);saved=true;}catch{}finally{resultSaving=false;$('popupContinueBtn').disabled=false;}}
     if(mine!==token)return;
     status(saved?'已保存，請換下一個條碼':'結果已保留');
-    if(s.continuous&&(!s.autoSave||saved)){scanning=true;}
-    else{releaseWake();idleTimer=setTimeout(()=>{if(mine===token&&!scanning){stop();status('相機已休眠，結果已保留');$('cameraStartOverlay').hidden=false;}},15000);}
+    // Resume only after an explicit continue action, even in continuous mode.
+    {releaseWake();idleTimer=setTimeout(()=>{if(mine===token&&!scanning){stop();status('相機已休眠，結果已保留');$('cameraStartOverlay').hidden=false;}},15000);}
+  }
+  function showResultDialog(){
+    if(!result)return;
+    scanning=false;clearTimeout(frameTimer);releaseWake();
+    $('popupCopyStatus').textContent='';$('popupResultValue').textContent=result.value;
+    $('popupResultMeta').textContent=`${result.format} · ${result.value.length} 字元`;
+    const url=Utils.normalizeOpenableUrl(result.value),link=$('popupOpenLink');
+    link.hidden=!url;link.href=url||'#';
+    $('popupUrlHint').textContent=url?`即將開啟：${new URL(url).hostname}。請先確認網址可信。`:'此內容不是完整 HTTP／HTTPS 網址，可複製文字使用。';
+    $('popupCopyBtn').textContent=url?'複製連結／文字':'複製文字';
+    $('popupSaveStatus').textContent=$('scanSaveStatus').textContent;
+    if(!$('scanResultDialog').open)$('scanResultDialog').showModal();
   }
   function renderResult(){
     if(!result)return;$('scanResultCard').hidden=false;$('page-scan').classList.add('has-result');
@@ -119,10 +139,12 @@ const Scanner=(()=>{
   }
   async function save(showToast=true){
     if(!result)return;const entry=result;
-    try{await Storage.addHistory(entry);if(result?.id===entry.id){$('saveScanBtn').disabled=true;$('saveScanBtn').textContent='已存入歷史';$('scanSaveStatus').textContent='✓ 已保存';$('incrementScanBtn').disabled=false;}if(showToast)Utils.toast('已存入歷史','success');}
-    catch(e){$('scanSaveStatus').textContent='保存失敗，請先複製結果';Utils.busyError(e,'未能保存，請先複製或匯出結果');if(!showToast)throw e;}
+    try{await Storage.addHistory(entry);if(result?.id===entry.id){$('saveScanBtn').disabled=true;$('saveScanBtn').textContent='已存入歷史';$('scanSaveStatus').textContent='✓ 已保存';$('incrementScanBtn').disabled=false;}$('popupSaveStatus').textContent=$('scanSaveStatus').textContent;if(showToast)Utils.toast('已存入歷史','success');}
+    catch(e){$('scanSaveStatus').textContent='保存失敗，請先複製結果';$('popupSaveStatus').textContent=$('scanSaveStatus').textContent;Utils.busyError(e,'未能保存，請先複製或匯出結果');if(!showToast)throw e;}
   }
   function continueScan(){
+    if(resultSaving){Utils.toast('正在保存，請稍候');return;}
+    if($('scanResultDialog').open)$('scanResultDialog').close();
     if(!running){start(deviceId);return;}clearTimeout(idleTimer);result=null;App.saveSessionResult(null);$('scanResultCard').hidden=true;$('page-scan').classList.remove('has-result');candidate={value:null,hits:0,at:0};scanning=true;requestWake(token);status('請對準下一個條碼');schedule(token);
   }
   async function tune(t){try{const c=t?.getCapabilities?.()||{};const advanced=[];for(const k of ['focusMode','exposureMode','whiteBalanceMode'])if(c[k]?.includes('continuous'))advanced.push({[k]:'continuous'});if(advanced.length)await t.applyConstraints({advanced});}catch{}}

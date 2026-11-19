@@ -37,7 +37,7 @@ const Utils = (() => {
   function debounce(fn,ms=200) { let t; return (...args) => { clearTimeout(t); t=setTimeout(()=>fn(...args),ms); }; }
   async function copyText(text) {
     try { await navigator.clipboard.writeText(String(text)); toast('已複製原始內容','success'); return true; }
-    catch { const el=document.createElement('textarea'); el.value=String(text); document.body.append(el); el.select(); let ok=false; try{ok=document.execCommand('copy');}catch{} el.remove(); toast(ok?'已複製原始內容':'請長按讀值手動複製',ok?'success':'error'); return ok; }
+    catch { const el=document.createElement('textarea'); el.value=String(text); (document.querySelector('dialog[open]')||document.body).append(el); el.select(); let ok=false; try{ok=document.execCommand('copy');}catch{} el.remove(); toast(ok?'已複製原始內容':'請長按讀值手動複製',ok?'success':'error'); return ok; }
   }
   async function shareText(title,text) { try { if(navigator.share){await navigator.share({title,text});return;} } catch(e){if(e.name==='AbortError')return;} await copyText(text); }
   function openUrl(value) {
